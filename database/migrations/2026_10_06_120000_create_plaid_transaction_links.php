@@ -44,7 +44,7 @@ return new class extends Migration {
                 $table->bigInteger('user_group_id', false, true);
                 $table->string('plaid_transaction_id', 255);
                 $table->integer('transaction_journal_id', false, true);
-                $table->string('leg', 16); // single, source or destination
+                $table->enum('leg', ['single', 'source', 'destination']);
                 $table->string('plaid_account_id', 255)->nullable();
                 $table->timestamps();
 
