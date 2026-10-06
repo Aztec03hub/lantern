@@ -31,7 +31,7 @@ use Exception;
 class PlaidLinkConflictException extends Exception
 {
     /**
-     * @param array<int, array{plaid_transaction_id: string, transaction_journal_id: int, transaction_group_id: int, leg: string}> $conflicts
+     * @param array<int, array{plaid_transaction_id: string, transaction_journal_id: ?int, transaction_group_id: ?int, leg: string}> $conflicts
      */
     public function __construct(public readonly array $conflicts)
     {

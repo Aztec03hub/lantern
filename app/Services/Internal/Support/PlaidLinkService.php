@@ -46,6 +46,8 @@ class PlaidLinkService
     public function sync(TransactionJournal $journal, array $links): void
     {
         $groupId   = $journal->user_group_id;
+        // fixed lock order: two concurrent requests with the same ids in opposite order cannot deadlock.
+        usort($links, static fn (array $a, array $b): int => strcmp($a['plaid_transaction_id'], $b['plaid_transaction_id']));
         $wanted    = array_column($links, 'plaid_transaction_id');
         PlaidTransactionLink::where('user_group_id', $groupId)
             ->where('transaction_journal_id', $journal->id)
@@ -63,7 +65,10 @@ class PlaidLinkService
                 continue;
             }
             if (null !== $existing) {
-                $existing->update($attributes);
+                // keyed query-builder update: the table has a composite key, so Model::update() would
+                // emit "where id is null" (500 on Postgres, silent no-op on SQLite). Never call
+                // save()/update()/delete() on a PlaidTransactionLink instance.
+                PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->update($attributes);
 
                 continue;
             }
@@ -75,8 +80,11 @@ class PlaidLinkService
                 });
             } catch (UniqueConstraintViolationException) {
                 // lost a race with a concurrent request that committed the same id first.
-                $winner = PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->firstOrFail();
-                $conflicts[] = $this->describe($winner);
+                // on MySQL (REPEATABLE READ) the winner may be invisible to this snapshot: still answer 409.
+                $winner = PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->first();
+                $conflicts[] = null === $winner
+                    ? ['plaid_transaction_id' => $link['plaid_transaction_id'], 'transaction_journal_id' => null, 'transaction_group_id' => null, 'leg' => $link['leg']]
+                    : $this->describe($winner);
             }
         }
         if ([] !== $conflicts) {
