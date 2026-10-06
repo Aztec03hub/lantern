@@ -113,11 +113,18 @@ let index = function () {
         },
 
         /**
+         * Format a token's expiry date. Lives here because the Alpine CSP build cannot parse "new" in templates.
+         */
+        formatDate(value) {
+            return new Date(value).toLocaleString();
+        },
+
+        /**
          * Show the form for creating new tokens.
          */
         showCreateTokenForm() {
             // console.log("showCreateTokenForm()");
-            new Modal(document.getElementById("modal-create-token"), {}).show();
+            Modal.getOrCreateInstance(document.getElementById("modal-create-token")).show();
         },
 
         /**
@@ -161,11 +168,11 @@ let index = function () {
          */
         showAccessToken(accessToken) {
             // console.log("showAccessToken");
-            new Modal(document.getElementById("modal-create-token"), {}).hide();
+            Modal.getOrCreateInstance(document.getElementById("modal-create-token")).hide();
 
             this.accessToken = accessToken;
 
-            new Modal(document.getElementById("modal-access-token"), {}).show();
+            Modal.getOrCreateInstance(document.getElementById("modal-access-token")).show();
         },
         getClients() {
             api.get("./oauth/clients").then((response) => {
@@ -174,7 +181,7 @@ let index = function () {
             });
         },
         showCreateClientForm() {
-            new Modal(document.getElementById("modal-create-client"), {}).show();
+            Modal.getOrCreateInstance(document.getElementById("modal-create-client")).show();
         },
         /**
          * Persist the client to storage using the given form.
@@ -190,7 +197,7 @@ let index = function () {
                     form.redirect_uris = "";
                     form.errors = [];
 
-                    new Modal(document.querySelector(modal), {}).hide();
+                    Modal.getOrCreateInstance(document.querySelector(modal)).hide();
 
                     if (response.data.plainSecret) {
                         this.showClientSecret(response.data.plainSecret);
@@ -221,12 +228,12 @@ let index = function () {
          */
         showClientSecret(clientSecret) {
             this.clientSecret = clientSecret;
-            new Modal(document.getElementById("modal-client-secret"), {}).show();
+            Modal.getOrCreateInstance(document.getElementById("modal-client-secret")).show();
         },
         regenerateSecret(client) {
             api.post("./oauth/clients/regenerate/" + client.id).then((response) => {
                 this.clientSecret = response.data.plainSecret;
-                new Modal(document.getElementById("modal-client-secret"), {}).show();
+                Modal.getOrCreateInstance(document.getElementById("modal-client-secret")).show();
             });
         },
 
@@ -252,7 +259,7 @@ let index = function () {
             this.editForm.name = client.name;
             this.editForm.redirect_uris = client.redirect_uris.join(",");
 
-            new Modal(document.getElementById("modal-edit-client"), {}).show();
+            Modal.getOrCreateInstance(document.getElementById("modal-edit-client")).show();
         },
 
         /**
