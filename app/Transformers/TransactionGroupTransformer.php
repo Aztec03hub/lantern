@@ -480,6 +480,7 @@ class TransactionGroupTransformer extends AbstractTransformer
             'internal_reference'              => $transaction['meta']['internal_reference'] ?? null,
             'external_id'                     => $transaction['meta']['external_id'] ?? null,
             'original_source'                 => $transaction['meta']['original_source'] ?? null,
+            'plaid_links'                     => $transaction['plaid_links'] ?? [],
             'recurrence_id'                   => $transaction['meta']['recurrence_id'] ?? null,
             'recurrence_total'                => $recurrenceTotal,
             'recurrence_count'                => $recurrenceCount,

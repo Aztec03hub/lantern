@@ -147,6 +147,10 @@ class StoreRequest extends FormRequest
             // meta info fields
             'transactions.*.internal_reference'    => ['min:1', 'max:255', 'nullable'],
             'transactions.*.external_id'           => ['min:1', 'max:255', 'nullable'],
+            'transactions.*.plaid_links'                    => ['array', 'nullable'],
+            'transactions.*.plaid_links.*.plaid_transaction_id' => ['required', 'string', 'min:1', 'max:255', 'distinct'],
+            'transactions.*.plaid_links.*.leg'                  => ['required', 'in:single,source,destination'],
+            'transactions.*.plaid_links.*.plaid_account_id'     => ['nullable', 'string', 'min:1', 'max:255'],
             'transactions.*.recurrence_id'         => ['min:1', 'max:255', 'nullable'],
             'transactions.*.bunq_payment_id'       => ['min:1', 'max:255', 'nullable'],
             'transactions.*.external_url'          => sprintf('min:1|max:255|nullable|url:%s', $validProtocols),
@@ -282,6 +286,7 @@ class StoreRequest extends FormRequest
                 // all custom fields:
                 'internal_reference'    => $this->clearString((string) $object['internal_reference']),
                 'external_id'           => $this->clearString((string) $object['external_id']),
+                'plaid_links'           => $this->plaidLinksFromValue($object['plaid_links']),
                 'original_source'       => sprintf('ff3-v%s', config('firefly.version')),
                 'recurrence_id'         => $this->integerFromValue($object['recurrence_id']),
                 'bunq_payment_id'       => $this->clearString((string) $object['bunq_payment_id']),

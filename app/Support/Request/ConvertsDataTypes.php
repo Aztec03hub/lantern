@@ -263,6 +263,22 @@ trait ConvertsDataTypes
     }
 
     /**
+     * Normalise Plaid link data; null (not submitted) stays null.
+     */
+    protected function plaidLinksFromValue(mixed $links): ?array
+    {
+        if (!is_array($links)) {
+            return null;
+        }
+
+        return array_values(array_map(fn (array $link): array => [
+            'plaid_transaction_id' => $this->clearString((string) $link['plaid_transaction_id']),
+            'leg'                  => (string) $link['leg'],
+            'plaid_account_id'     => $this->clearString((string) ($link['plaid_account_id'] ?? '')),
+        ], $links));
+    }
+
+    /**
      * @param mixed $array
      */
     protected function arrayFromValue($array): ?array

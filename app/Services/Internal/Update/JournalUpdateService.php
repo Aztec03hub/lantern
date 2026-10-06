@@ -46,6 +46,7 @@ use FireflyIII\Repositories\Category\CategoryRepositoryInterface;
 use FireflyIII\Repositories\Currency\CurrencyRepositoryInterface;
 use FireflyIII\Repositories\TransactionGroup\TransactionGroupRepositoryInterface;
 use FireflyIII\Services\Internal\Support\JournalServiceTrait;
+use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\Support\Facades\AppConfiguration;
 use FireflyIII\Support\Facades\Preferences;
 use FireflyIII\Support\Facades\Steam;
@@ -196,6 +197,9 @@ class JournalUpdateService
         $this->updateAmount();
         $this->updateForeignAmount();
         $this->updateLocation();
+        if (is_array($this->data['plaid_links'] ?? null)) {
+            app(PlaidLinkService::class)->sync($this->transactionJournal, $this->data['plaid_links']);
+        }
 
         Preferences::mark();
 

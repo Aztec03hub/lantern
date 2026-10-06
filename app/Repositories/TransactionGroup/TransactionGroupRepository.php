@@ -388,7 +388,7 @@ class TransactionGroupRepository implements TransactionGroupRepositoryInterface,
         /** @var GroupUpdateService $service */
         $service = app(GroupUpdateService::class);
 
-        return $service->update($transactionGroup, $data);
+        return DB::transaction(static fn (): TransactionGroup => $service->update($transactionGroup, $data));
     }
 
     private function expandJournal(TransactionJournal $journal): array

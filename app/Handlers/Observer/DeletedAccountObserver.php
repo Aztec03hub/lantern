@@ -26,6 +26,7 @@ namespace FireflyIII\Handlers\Observer;
 
 use FireflyIII\Models\Account;
 use FireflyIII\Models\Attachment;
+use FireflyIII\Models\PlaidTransactionLink;
 use FireflyIII\Models\Transaction;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
@@ -62,6 +63,7 @@ class DeletedAccountObserver
 
         if (count($journalIds) > 0) {
             Transaction::query()->whereIn('transaction_journal_id', $journalIds)->delete();
+            PlaidTransactionLink::query()->whereIn('transaction_journal_id', $journalIds)->delete();
             TransactionJournal::query()->whereIn('id', $journalIds)->delete();
         }
         if (count($groupIds) > 0) {

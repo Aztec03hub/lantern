@@ -596,6 +596,18 @@ Route::group(
         Route::get('{tagOrId}/attachments', ['uses' => 'ListController@attachments', 'as' => 'attachments']);
     }
 );
+// Plaid link lookup:
+Route::group(
+    [
+        'namespace' => 'FireflyIII\Api\V1\Controllers\Models\Transaction',
+        'prefix'    => 'v1/plaid-links',
+        'as'        => 'api.v1.plaid-links.',
+    ],
+    static function (): void {
+        Route::get('', ['uses' => 'PlaidLinkController@index', 'as' => 'index']);
+    }
+);
+
 // Transaction API routes:
 Route::group(
     [

@@ -29,6 +29,7 @@ use FireflyIII\Api\V1\Requests\Models\Transaction\StoreRequest;
 use FireflyIII\Enums\UserRoleEnum;
 use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
+use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Helpers\Collector\GroupCollectorInterface;
 use FireflyIII\Repositories\TransactionGroup\TransactionGroupRepositoryInterface;
 use FireflyIII\Rules\IsDuplicateTransaction;
@@ -100,6 +101,8 @@ final class StoreController extends Controller
             ]);
 
             throw new ValidationException($validator);
+        } catch (PlaidLinkConflictException $e) {
+            return response()->json(['message' => $e->getMessage(), 'conflicts' => $e->conflicts], 409)->header('Content-Type', self::CONTENT_TYPE);
         } catch (FireflyException $e) {
             Log::warning('Caught an exception. Return error message.');
             Log::error($e->getMessage());

@@ -29,6 +29,8 @@ use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\UserGroup;
 use FireflyIII\User;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -61,13 +63,22 @@ class TransactionGroupFactory
         $this->journalFactory->setUserGroup($data['user_group']);
         $this->journalFactory->setErrorOnHash($data['error_if_duplicate_hash'] ?? false);
 
-        try {
-            $collection = $this->journalFactory->create($data);
-        } catch (DuplicateTransactionException $e) {
-            Log::warning('GroupFactory::create() caught journalFactory::create() with a duplicate!');
+        // journals, group and Plaid links are written in one database transaction.
+        return DB::transaction(function () use ($data): TransactionGroup {
+            try {
+                $collection = $this->journalFactory->create($data);
+            } catch (DuplicateTransactionException $e) {
+                Log::warning('GroupFactory::create() caught journalFactory::create() with a duplicate!');
 
-            throw new DuplicateTransactionException($e->getMessage(), 0, $e);
-        }
+                throw new DuplicateTransactionException($e->getMessage(), 0, $e);
+            }
+
+            return $this->createGroup($data, $collection);
+        });
+    }
+
+    private function createGroup(array $data, Collection $collection): TransactionGroup
+    {
         $title        = $data['group_title'] ?? null;
         $title        = '' === $title ? null : $title;
 

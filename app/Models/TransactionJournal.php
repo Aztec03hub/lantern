@@ -74,6 +74,19 @@ class TransactionJournal extends Model
 
     protected $hidden   = ['encrypted'];
 
+    protected static function booted(): void
+    {
+        // journals are soft deleted, so the foreign key cascade never fires. Free the Plaid ids explicitly.
+        static::deleted(static function (TransactionJournal $journal): void {
+            PlaidTransactionLink::where('transaction_journal_id', $journal->id)->delete();
+        });
+    }
+
+    public function plaidLinks(): HasMany
+    {
+        return $this->hasMany(PlaidTransactionLink::class);
+    }
+
     /**
      * Checks if tables are joined.
      */

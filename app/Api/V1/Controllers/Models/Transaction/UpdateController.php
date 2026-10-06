@@ -31,6 +31,7 @@ use FireflyIII\Events\Model\TransactionGroup\TransactionGroupEventObjects;
 use FireflyIII\Events\Model\TransactionGroup\UpdatedSingleTransactionGroup;
 use FireflyIII\Events\Model\Webhook\WebhookMessagesRequestSending;
 use FireflyIII\Helpers\Collector\GroupCollectorInterface;
+use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Repositories\TransactionGroup\TransactionGroupRepositoryInterface;
 use FireflyIII\Support\Facades\Preferences;
@@ -81,7 +82,11 @@ final class UpdateController extends Controller
         Log::debug('Now in update routine for transaction group', $data);
         $oldHash                  = $this->groupRepository->getCompareHash($transactionGroup);
         $objects                  = TransactionGroupEventObjects::collectFromTransactionGroup($transactionGroup);
-        $transactionGroup         = $this->groupRepository->update($transactionGroup, $data);
+        try {
+            $transactionGroup = $this->groupRepository->update($transactionGroup, $data);
+        } catch (PlaidLinkConflictException $e) {
+            return response()->json(['message' => $e->getMessage(), 'conflicts' => $e->conflicts], 409)->header('Content-Type', self::CONTENT_TYPE);
+        }
         $objects->appendFromTransactionGroup($transactionGroup);
         $newHash                  = $this->groupRepository->getCompareHash($transactionGroup);
         $manager                  = $this->getManager();

@@ -48,6 +48,7 @@ use FireflyIII\Repositories\PiggyBank\PiggyBankRepositoryInterface;
 use FireflyIII\Repositories\TransactionType\TransactionTypeRepositoryInterface;
 use FireflyIII\Services\Internal\Destroy\JournalDestroyService;
 use FireflyIII\Services\Internal\Support\JournalServiceTrait;
+use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\Support\Facades\Amount;
 use FireflyIII\Support\Facades\AppConfiguration;
 use FireflyIII\Support\NullArrayObject;
@@ -405,6 +406,9 @@ class TransactionJournalFactory
         $this->storeTags($journal, $row['tags']);
         $this->storeMetaFields($journal, $row);
         $this->storeLocation($journal, $row);
+        if (is_array($row['plaid_links'])) {
+            app(PlaidLinkService::class)->sync($journal, $row['plaid_links']);
+        }
 
         return $journal;
     }

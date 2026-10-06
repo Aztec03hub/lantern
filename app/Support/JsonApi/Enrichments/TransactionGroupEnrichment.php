@@ -29,6 +29,7 @@ use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Models\Attachment;
 use FireflyIII\Models\Location;
 use FireflyIII\Models\Note;
+use FireflyIII\Models\PlaidTransactionLink;
 use FireflyIII\Models\Tag;
 use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\TransactionGroup;
@@ -52,6 +53,7 @@ class TransactionGroupEnrichment implements EnrichmentInterface
     private array $locations       = [];
     private array $metaData        = [];
     private array $notes           = [];
+    private array $plaidLinks      = [];
     private readonly TransactionCurrency $primaryCurrency;
     private array $tags            = [];
 
@@ -71,6 +73,7 @@ class TransactionGroupEnrichment implements EnrichmentInterface
 
         // collect first, then enrich.
         $this->collectNotes();
+        $this->collectPlaidLinks();
         $this->collectTags();
         $this->collectMetaData();
         $this->collectLocations();
@@ -101,6 +104,7 @@ class TransactionGroupEnrichment implements EnrichmentInterface
     private function appendCollectedData(): void
     {
         $notes            = $this->notes;
+        $plaidLinks       = $this->plaidLinks;
         $tags             = $this->tags;
         $metaData         = $this->metaData;
         $locations        = $this->locations;
@@ -110,6 +114,7 @@ class TransactionGroupEnrichment implements EnrichmentInterface
         $this->collection = $this->collection->map(function (array $item) use (
             $primaryCurrency,
             $notes,
+            $plaidLinks,
             $tags,
             $metaData,
             $locations,
@@ -120,6 +125,9 @@ class TransactionGroupEnrichment implements EnrichmentInterface
 
                 // attach notes if they exist:
                 $item['transactions'][$index]['notes']            = $notes[$journalId] ?? null;
+
+                // attach Plaid links (read-only):
+                $item['transactions'][$index]['plaid_links']      = $plaidLinks[$journalId] ?? [];
 
                 // attach tags if they exist:
                 $item['transactions'][$index]['tags']             = array_key_exists($journalId, $tags) ? $tags[$journalId] : [];
@@ -231,6 +239,18 @@ class TransactionGroupEnrichment implements EnrichmentInterface
                 continue;
             }
             $this->metaData[(int) $entry['transaction_journal_id']][$name] = $data;
+        }
+    }
+
+    private function collectPlaidLinks(): void
+    {
+        $links = PlaidTransactionLink::query()->whereIn('transaction_journal_id', $this->journalIds)->orderBy('plaid_transaction_id')->get();
+        foreach ($links as $link) {
+            $this->plaidLinks[$link->transaction_journal_id][] = [
+                'plaid_transaction_id' => $link->plaid_transaction_id,
+                'leg'                  => $link->leg,
+                'plaid_account_id'     => $link->plaid_account_id,
+            ];
         }
     }
 

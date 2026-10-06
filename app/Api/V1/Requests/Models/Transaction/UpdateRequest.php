@@ -157,6 +157,11 @@ class UpdateRequest extends FormRequest
             // group id:
             'transactions.*.transaction_journal_id' => ['nullable', 'numeric', new BelongsUser()],
 
+            'transactions.*.plaid_links'                    => ['array', 'nullable'],
+            'transactions.*.plaid_links.*.plaid_transaction_id' => ['required', 'string', 'min:1', 'max:255', 'distinct'],
+            'transactions.*.plaid_links.*.leg'                  => ['required', 'in:single,source,destination'],
+            'transactions.*.plaid_links.*.plaid_account_id'     => ['nullable', 'string', 'min:1', 'max:255'],
+
             // currency info
             'transactions.*.currency_id'            => ['numeric', 'exists:transaction_currencies,id', 'nullable'],
             'transactions.*.currency_code'          => ['min:3', 'max:51', 'exists:transaction_currencies,code', 'nullable'],
@@ -404,6 +409,9 @@ class UpdateRequest extends FormRequest
             $current  = $this->getBooleanData($current, $transaction);
             $current  = $this->getArrayData($current, $transaction);
             $current  = $this->getFloatData($current, $transaction);
+            if (array_key_exists('plaid_links', $transaction)) {
+                $current['plaid_links'] = $this->plaidLinksFromValue($transaction['plaid_links']) ?? [];
+            }
             $return[] = $current;
         }
 
