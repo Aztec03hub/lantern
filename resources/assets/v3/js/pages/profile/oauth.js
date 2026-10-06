@@ -21,6 +21,7 @@
 import "../../boot/bootstrap.js";
 import sidebar from "../../pages/shared/sidebar.js";
 import dates from "../shared/dates.js";
+import format from "../../util/format.js";
 import i18next from "i18next";
 import { api } from "../../boot/axios";
 import { Modal } from "bootstrap";
@@ -116,7 +117,7 @@ let index = function () {
          * Format a token's expiry date. Lives here because the Alpine CSP build cannot parse "new" in templates.
          */
         formatDate(value) {
-            return new Date(value).toLocaleString();
+            return value ? format(new Date(value), "PPpp") : "";
         },
 
         /**
