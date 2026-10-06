@@ -274,7 +274,7 @@ trait ConvertsDataTypes
         return array_values(array_map(fn (array $link): array => [
             'plaid_transaction_id' => $this->clearString((string) $link['plaid_transaction_id']),
             'leg'                  => (string) $link['leg'],
-            'plaid_account_id'     => $this->clearString((string) ($link['plaid_account_id'] ?? '')),
+            'plaid_account_id'     => '' === ($id = $this->clearString((string) ($link['plaid_account_id'] ?? ''))) ? null : $id,
         ], $links));
     }
 

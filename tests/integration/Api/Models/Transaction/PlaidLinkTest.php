@@ -160,6 +160,13 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame(0, TransactionJournal::count());
     }
 
+    public function testMissingPlaidAccountIdIsNull(): void
+    {
+        $payload = $this->payload('A1');
+        unset($payload['transactions'][0]['plaid_links'][0]['plaid_account_id']);
+        $this->postJson(route('api.v1.transactions.store'), $payload)->assertOk()->assertJsonPath('data.attributes.transactions.0.plaid_links.0.plaid_account_id', null);
+    }
+
     public function testCreateWithoutLinksStillWorks(): void
     {
         $payload = $this->payload('X');
