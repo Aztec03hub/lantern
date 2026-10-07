@@ -28,6 +28,7 @@ use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\UserGroup;
+use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\User;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -65,6 +66,17 @@ class TransactionGroupFactory
 
         // journals, group and Plaid links are written in one database transaction.
         return DB::transaction(function () use ($data): TransactionGroup {
+            $ids = [];
+            foreach ($data['transactions'] ?? [] as $row) {
+                if (is_array($row['plaid_links'] ?? null)) {
+                    $ids = array_merge($ids, array_column($row['plaid_links'], 'plaid_transaction_id'));
+                }
+            }
+            if ([] !== $ids) {
+                // one lock order across ALL splits of the request (R2-5)
+                app(PlaidLinkService::class)->lockIds((int) $data['user_group']->id, $ids);
+            }
+
             try {
                 $collection = $this->journalFactory->create($data);
             } catch (DuplicateTransactionException $e) {

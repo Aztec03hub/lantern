@@ -24,10 +24,13 @@ declare(strict_types=1);
 namespace Tests\integration\Api\Models\Transaction;
 
 use FireflyIII\Enums\AccountTypeEnum;
+use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\PlaidTransactionLink;
 use FireflyIII\Models\TransactionJournal;
+use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\User;
+use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Override;
 use Tests\integration\TestCase;
@@ -183,13 +186,166 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame(0, PlaidTransactionLink::count());
     }
 
-    public function testOppositeOrderRequestsBothSucceedForDifferentJournals(): void
+    public function testOppositeOrderSecondRequestIs409(): void
     {
-        // links are written sorted by id, whatever the request order (lock order, F6)
-        $a = $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('Z9', 'A1'))->assertOk()->json('data.id');
-        $this->assertSame(['A1', 'Z9'], PlaidTransactionLink::orderBy('plaid_transaction_id')->pluck('plaid_transaction_id')->all());
-        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('A1', 'Z9'))->assertStatus(409);
-        $this->assertNotNull($a);
+        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('Z9', 'A1'))->assertOk();
+        $res = $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('A1', 'Z9'))->assertStatus(409);
+        $this->assertCount(2, $res->json('conflicts'));
+    }
+
+    /** Insert order (not read-back order) is sorted: this is the lock order that prevents deadlocks (F6). */
+    public function testInsertOrderIsSorted(): void
+    {
+        $order = [];
+        PlaidTransactionLink::creating(static function (PlaidTransactionLink $l) use (&$order): void {
+            $order[] = $l->plaid_transaction_id;
+        });
+        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('Z9', 'A1'))->assertOk();
+        $this->assertSame(['A1', 'Z9'], $order);
+    }
+
+    /** Postgres: locks for the Plaid ids of ALL splits are taken once, in sorted order, before any write (R2-5). */
+    public function testAdvisoryLocksAreTakenInSortedOrderAcrossSplits(): void
+    {
+        if ('pgsql' !== \Illuminate\Support\Facades\DB::connection()->getDriverName()) {
+            $this->markTestSkipped('advisory locks are Postgres only');
+        }
+        $locks = [];
+        \Illuminate\Support\Facades\DB::listen(static function ($q) use (&$locks): void {
+            if (str_contains($q->sql, 'pg_advisory_xact_lock')) {
+                $locks[] = $q->bindings[0];
+            }
+        });
+        $this->postJson(route('api.v1.transactions.store'), $this->splitPayload([['Z9'], ['A1']]))->assertOk();
+        $gid = $this->user->user_group_id;
+        $this->assertSame([$gid.':A1', $gid.':Z9'], $locks);
+    }
+
+    /** Both splits of a create conflict: every conflicting id is listed (R2-2). */
+    public function testConflictsInTwoSplitsAreAllListed(): void
+    {
+        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('C1', 'C2'))->assertOk();
+        $res = $this->postJson(route('api.v1.transactions.store'), $this->splitPayload([['C1'], ['C2']]))->assertStatus(409);
+        $this->assertEqualsCanonicalizing(['C1', 'C2'], array_column($res->json('conflicts'), 'plaid_transaction_id'));
+        $this->assertSame(1, TransactionJournal::count());
+    }
+
+    /** Update path: conflicts of every split are listed and the whole update is rolled back. */
+    public function testUpdateConflictsInTwoSplitsAreAllListed(): void
+    {
+        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('C1', 'C2'))->assertOk();
+        [$group, $j1, $j2] = $this->splitGroup();
+        $res = $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['group_title' => 'split', 'transactions' => [
+            ['transaction_journal_id' => (string) $j1, 'description' => 'changed', 'plaid_links' => [['plaid_transaction_id' => 'C1', 'leg' => 'single']]],
+            ['transaction_journal_id' => (string) $j2, 'plaid_links' => [['plaid_transaction_id' => 'C2', 'leg' => 'single']]],
+        ]])->assertStatus(409);
+        $this->assertEqualsCanonicalizing(['C1', 'C2'], array_column($res->json('conflicts'), 'plaid_transaction_id'));
+        $this->assertNotSame('changed', TransactionJournal::find($j1)->description);
+    }
+
+    /** R2-1: moving an id between splits works whichever split is listed first. */
+    public function testMoveIdBetweenSplitsReceiverListedFirst(): void
+    {
+        [$group, $holder, $other] = $this->splitGroup();
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['group_title' => 'split', 'transactions' => [
+            ['transaction_journal_id' => (string) $other, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+            ['transaction_journal_id' => (string) $holder, 'plaid_links' => []],
+        ]])->assertOk();
+        $this->assertSame($other, PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
+        $this->assertSame(1, PlaidTransactionLink::count());
+    }
+
+    public function testMoveIdBetweenSplitsGiverListedFirst(): void
+    {
+        [$group, $holder, $other] = $this->splitGroup();
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['group_title' => 'split', 'transactions' => [
+            ['transaction_journal_id' => (string) $holder, 'plaid_links' => []],
+            ['transaction_journal_id' => (string) $other, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+        ]])->assertOk();
+        $this->assertSame($other, PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
+    }
+
+    /** The giving split is not in the request at all. */
+    public function testMoveIdWhenGivingSplitIsOmitted(): void
+    {
+        [$group, $holder, $other] = $this->splitGroup();
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['transactions' => [
+            ['transaction_journal_id' => (string) $other, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+        ]])->assertOk();
+        $this->assertSame(1, PlaidTransactionLink::count());
+    }
+
+    /** A move must not steal an id that belongs to another group's journal; and a real conflict stays a 409. */
+    public function testIdOnAnotherGroupsTransactionIsStillA409(): void
+    {
+        $other = $this->postJson(route('api.v1.transactions.store'), $this->payload('X1'))->assertOk()->json('data.id');
+        [$group, , $j2] = $this->splitGroup();
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['transactions' => [
+            ['transaction_journal_id' => (string) $j2, 'plaid_links' => [['plaid_transaction_id' => 'X1', 'leg' => 'single']]],
+        ]])->assertStatus(409)->assertJsonPath('conflicts.0.transaction_group_id', (int) $other);
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'X1')->count());
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'M1')->count());
+    }
+
+    /** An FK violation must not be reported as "already imported" (409 means a different transaction only). */
+    public function testForeignKeyViolationIsNotAConflict(): void
+    {
+        $journal                = new TransactionJournal();
+        $journal->id            = 987654;
+        $journal->user_group_id = $this->user->user_group_id;
+        $caught                 = null;
+
+        try {
+            app(PlaidLinkService::class)->sync($journal, [['plaid_transaction_id' => 'FK1', 'leg' => 'single', 'plaid_account_id' => null]]);
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+        $this->assertNotInstanceOf(PlaidLinkConflictException::class, $caught);
+        $this->assertInstanceOf(QueryException::class, $caught);
+    }
+
+    /** A CHECK violation (bad leg reaching the database) is not a conflict either, and the constraint exists. */
+    public function testCheckViolationIsNotAConflict(): void
+    {
+        [, $j1] = $this->splitGroup();
+        $caught = null;
+
+        try {
+            app(PlaidLinkService::class)->sync(TransactionJournal::find($j1), [['plaid_transaction_id' => 'CK1', 'leg' => 'bogus', 'plaid_account_id' => null]]);
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+        $this->assertNotInstanceOf(PlaidLinkConflictException::class, $caught);
+        $this->assertInstanceOf(QueryException::class, $caught);
+    }
+
+    /** The keyed update must never touch another user group's row with the same Plaid id. */
+    public function testKeyedUpdateDoesNotTouchOtherGroup(): void
+    {
+        [, $j1] = $this->splitGroup();
+        $group  = \FireflyIII\Models\UserGroup::create(['title' => 'other']);
+        $other  = User::create(['email' => 'other3@email.com', 'password' => 'password', 'user_group_id' => $group->id]);
+        \FireflyIII\Models\GroupMembership::create(['user_id' => $other->id, 'user_group_id' => $group->id, 'user_role_id' => \FireflyIII\Models\UserRole::where('title', 'owner')->value('id')]);
+        $oacc   = Account::factory()->for($other)->withType(AccountTypeEnum::ASSET)->create(['user_group_id' => $group->id]);
+        $this->actingAs($other, 'api');
+        $p                                       = $this->payload('M1');
+        $p['transactions'][0]['source_id']       = (string) $oacc->id;
+        $p['transactions'][0]['plaid_links'][0]['plaid_account_id'] = 'theirs';
+        $this->postJson(route('api.v1.transactions.store'), $p)->assertOk();
+        $this->actingAs($this->user, 'api');
+        app(PlaidLinkService::class)->sync(TransactionJournal::find($j1), [['plaid_transaction_id' => 'M1', 'leg' => 'source', 'plaid_account_id' => 'mine']]);
+        $theirs = PlaidTransactionLink::where('user_group_id', $other->user_group_id)->where('plaid_transaction_id', 'M1');
+        $this->assertSame('theirs', $theirs->value('plaid_account_id'));
+        $this->assertSame('single', $theirs->value('leg'));
+        $this->assertSame('mine', PlaidTransactionLink::where('user_group_id', $this->user->user_group_id)->where('plaid_transaction_id', 'M1')->value('plaid_account_id'));
+    }
+
+    /** leg is constrained in the database (3c4ea5154d). */
+    public function testLegColumnIsAnEnum(): void
+    {
+        $this->expectException(QueryException::class);
+        [, $j1] = $this->splitGroup();
+        PlaidTransactionLink::query()->insert(['user_group_id' => $this->user->user_group_id, 'plaid_transaction_id' => 'E1', 'transaction_journal_id' => $j1, 'leg' => 'bogus']);
     }
 
     public function testAccountDeleteFreesLinksAndReimportWorks(): void
@@ -246,6 +402,33 @@ final class PlaidLinkTest extends TestCase
         $this->actingAs($this->user, 'api');
         $this->checking = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create();
         $this->savings  = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create();
+    }
+
+    /** @param array<int, array<int, string>> $splits plaid ids per split @return array */
+    private function splitPayload(array $splits): array
+    {
+        $payload                = $this->payload('unused');
+        $payload['group_title'] = 'split';
+        $payload['transactions'] = [];
+        foreach ($splits as $i => $ids) {
+            $row                = $this->payload('unused')['transactions'][0];
+            $row['description'] = 'split '.$i;
+            $row['plaid_links'] = array_map(static fn (string $id): array => ['plaid_transaction_id' => $id, 'leg' => 'single'], $ids);
+            $payload['transactions'][] = $row;
+        }
+
+        return $payload;
+    }
+
+    /** @return array{0:int,1:int,2:int} group, journal holding M1, journal without links */
+    private function splitGroup(): array
+    {
+        $res    = $this->postJson(route('api.v1.transactions.store'), $this->splitPayload([['M1'], []]))->assertOk();
+        $holder = (int) PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id');
+        $ids    = array_map('intval', array_column($res->json('data.attributes.transactions'), 'transaction_journal_id'));
+        $other  = $ids[0] === $holder ? $ids[1] : $ids[0];
+
+        return [(int) $res->json('data.id'), $holder, $other];
     }
 
     private function twoLegPayload(string $first, string $second): array

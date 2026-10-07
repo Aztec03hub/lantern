@@ -45,6 +45,7 @@ use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Models\TransactionJournalLink;
 use FireflyIII\Repositories\Attachment\AttachmentRepositoryInterface;
 use FireflyIII\Services\Internal\Destroy\TransactionGroupDestroyService;
+use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\Services\Internal\Update\GroupUpdateService;
 use FireflyIII\Support\Facades\Amount;
 use FireflyIII\Support\Facades\Preferences;
@@ -388,7 +389,27 @@ class TransactionGroupRepository implements TransactionGroupRepositoryInterface,
         /** @var GroupUpdateService $service */
         $service = app(GroupUpdateService::class);
 
-        return DB::transaction(static fn (): TransactionGroup => $service->update($transactionGroup, $data));
+        return DB::transaction(static function () use ($service, $transactionGroup, $data): TransactionGroup {
+            $splits = $data['transactions'] ?? [];
+            $ids    = [];
+            foreach ($splits as $split) {
+                if (is_array($split['plaid_links'] ?? null)) {
+                    $ids = array_merge($ids, array_column($split['plaid_links'], 'plaid_transaction_id'));
+                }
+            }
+            if ([] !== $ids) {
+                $plaid      = app(PlaidLinkService::class);
+                $journalIds = $transactionGroup->transactionJournals()->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+                // a single submitted split of a single-journal group needs no transaction_journal_id.
+                if (1 === count($splits) && 1 === count($journalIds)) {
+                    $splits[array_key_first($splits)]['transaction_journal_id'] ??= $journalIds[0];
+                }
+                $plaid->lockIds((int) $transactionGroup->user_group_id, $ids);
+                $plaid->releaseMovedIds((int) $transactionGroup->user_group_id, $journalIds, $splits);
+            }
+
+            return $service->update($transactionGroup, $data);
+        });
     }
 
     private function expandJournal(TransactionJournal $journal): array

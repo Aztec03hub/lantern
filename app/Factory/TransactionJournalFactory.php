@@ -30,6 +30,7 @@ use FireflyIII\Enums\AccountTypeEnum;
 use FireflyIII\Enums\TransactionTypeEnum;
 use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
+use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\Bill;
 use FireflyIII\Models\Location;
@@ -118,13 +119,22 @@ class TransactionJournalFactory
             return new Collection();
         }
         $batchSubmission = $data['batch_submission'] ?? false;
+        $plaidConflicts  = [];
 
         try {
             /** @var array $row */
             foreach ($transactions as $index => $row) {
                 $row['batch_submission'] = $batchSubmission;
                 Log::debug(sprintf('Now creating journal %d/%d', $index + 1, count($transactions)));
-                $journal                 = $this->createJournal(new NullArrayObject($row));
+
+                try {
+                    $journal = $this->createJournal(new NullArrayObject($row));
+                } catch (PlaidLinkConflictException $e) {
+                    // keep going so the 409 lists the conflicts of EVERY split; the caller's transaction rolls back.
+                    $plaidConflicts = array_merge($plaidConflicts, $e->conflicts);
+
+                    continue;
+                }
                 if ($journal instanceof TransactionJournal) {
                     $collection->push($journal);
                 }
@@ -146,6 +156,9 @@ class TransactionJournalFactory
             $this->forceDeleteOnError($collection);
 
             throw new FireflyException($e->getMessage(), 0, $e);
+        }
+        if ([] !== $plaidConflicts) {
+            throw new PlaidLinkConflictException($plaidConflicts);
         }
 
         return $collection;

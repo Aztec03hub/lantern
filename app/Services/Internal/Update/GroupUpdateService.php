@@ -27,6 +27,7 @@ namespace FireflyIII\Services\Internal\Update;
 use FireflyIII\Events\Model\TransactionGroup\TransactionGroupRequestsAuditLogEntry;
 use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
+use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Factory\TransactionJournalFactory;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
@@ -174,6 +175,8 @@ class GroupUpdateService
         Log::debug(sprintf('Now in %s', __METHOD__));
         // updated or created transaction journals:
         $updated = [];
+        // Plaid conflicts of every split are collected, so the 409 lists them all.
+        $plaidConflicts = [];
 
         /**
          * @var int   $index
@@ -200,7 +203,13 @@ class GroupUpdateService
                     }
                 }
                 Log::debug('Call createTransactionJournal');
-                $newJournal = $this->createTransactionJournal($transactionGroup, $transaction);
+                try {
+                    $newJournal = $this->createTransactionJournal($transactionGroup, $transaction);
+                } catch (PlaidLinkConflictException $e) {
+                    $plaidConflicts = array_merge($plaidConflicts, $e->conflicts);
+
+                    continue;
+                }
                 Log::debug('Done calling createTransactionJournal');
                 if ($newJournal instanceof TransactionJournal) {
                     $updated[] = $newJournal->id;
@@ -211,10 +220,19 @@ class GroupUpdateService
             }
             if (null !== $journal) {
                 Log::debug('Call updateTransactionJournal');
-                $this->updateTransactionJournal($transactionGroup, $journal, $transaction);
+                try {
+                    $this->updateTransactionJournal($transactionGroup, $journal, $transaction);
+                } catch (PlaidLinkConflictException $e) {
+                    $plaidConflicts = array_merge($plaidConflicts, $e->conflicts);
+
+                    continue;
+                }
                 $updated[] = $journal->id;
                 Log::debug('Done calling updateTransactionJournal');
             }
+        }
+        if ([] !== $plaidConflicts) {
+            throw new PlaidLinkConflictException($plaidConflicts);
         }
 
         return $updated;

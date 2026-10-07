@@ -57,39 +57,111 @@ class PlaidLinkService
 
         $conflicts = [];
         foreach ($links as $link) {
-            $attributes = ['leg' => $link['leg'], 'plaid_account_id' => $link['plaid_account_id'] ?? null, 'transaction_journal_id' => $journal->id];
-            $existing   = PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->first();
-            if (null !== $existing && $existing->transaction_journal_id !== $journal->id) {
-                $conflicts[] = $this->describe($existing);
-
-                continue;
-            }
-            if (null !== $existing) {
-                // keyed query-builder update: the table has a composite key, so Model::update() would
-                // emit "where id is null" (500 on Postgres, silent no-op on SQLite). Never call
-                // save()/update()/delete() on a PlaidTransactionLink instance.
-                PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->update($attributes);
-
-                continue;
-            }
-
-            try {
-                // savepoint: on Postgres a failed insert would otherwise poison the whole transaction.
-                DB::transaction(static function () use ($groupId, $link, $attributes): void {
-                    PlaidTransactionLink::create(['user_group_id' => $groupId, 'plaid_transaction_id' => $link['plaid_transaction_id']] + $attributes);
-                });
-            } catch (UniqueConstraintViolationException) {
-                // lost a race with a concurrent request that committed the same id first.
-                // on MySQL (REPEATABLE READ) the winner may be invisible to this snapshot: still answer 409.
-                $winner = PlaidTransactionLink::where('user_group_id', $groupId)->where('plaid_transaction_id', $link['plaid_transaction_id'])->first();
-                $conflicts[] = null === $winner
-                    ? ['plaid_transaction_id' => $link['plaid_transaction_id'], 'transaction_journal_id' => null, 'transaction_group_id' => null, 'leg' => $link['leg']]
-                    : $this->describe($winner);
+            $conflict = $this->writeLink($groupId, $journal, $link);
+            if (null !== $conflict) {
+                $conflicts[] = $conflict;
             }
         }
         if ([] !== $conflicts) {
             throw new PlaidLinkConflictException($conflicts);
         }
+    }
+
+    /**
+     * Take a transaction-scoped Postgres advisory lock for every Plaid id of a whole request, in sorted order,
+     * before any link row is touched. Two requests with the same ids in opposite order across splits then queue
+     * instead of deadlocking (R2-5). Other drivers: no-op. Call inside the database transaction.
+     *
+     * @param array<int, string> $ids
+     */
+    public function lockIds(int $groupId, array $ids): void
+    {
+        if ('pgsql' !== DB::connection()->getDriverName()) {
+            return;
+        }
+        $ids = array_values(array_unique($ids));
+        sort($ids, SORT_STRING);
+        foreach ($ids as $id) {
+            DB::select('select pg_advisory_xact_lock(hashtext(?))', [$groupId.':'.$id]);
+        }
+    }
+
+    /**
+     * Free every id of $splits that currently sits on a DIFFERENT journal of this group than the split that
+     * wants it, so that moving an id between splits works in any split order (R2-1). The per-journal sync then
+     * inserts it on the right journal. Ids on journals of other groups are never touched.
+     *
+     * @param array<int, array<string, mixed>> $splits   submitted splits (with optional transaction_journal_id and plaid_links)
+     * @param array<int, int>                  $journalIds ids of the journals of the group being updated
+     */
+    public function releaseMovedIds(int $groupId, array $journalIds, array $splits): void
+    {
+        foreach ($splits as $split) {
+            if (!is_array($split['plaid_links'] ?? null) || [] === $split['plaid_links']) {
+                continue;
+            }
+            $ids = array_column($split['plaid_links'], 'plaid_transaction_id');
+            PlaidTransactionLink::where('user_group_id', $groupId)
+                ->whereIn('transaction_journal_id', $journalIds)
+                ->whereIn('plaid_transaction_id', $ids)
+                ->where('transaction_journal_id', '!=', (int) ($split['transaction_journal_id'] ?? 0))
+                ->delete()
+            ;
+        }
+    }
+
+    /**
+     * @return null|array{plaid_transaction_id: string, transaction_journal_id: ?int, transaction_group_id: ?int, leg: string}
+     */
+    private function writeLink(int $groupId, TransactionJournal $journal, array $link, bool $retried = false): ?array
+    {
+        $attributes = ['leg' => $link['leg'], 'plaid_account_id' => $link['plaid_account_id'] ?? null, 'transaction_journal_id' => $journal->id];
+        $key        = ['user_group_id' => $groupId, 'plaid_transaction_id' => $link['plaid_transaction_id']];
+        $existing   = PlaidTransactionLink::where($key)->first();
+        if (null !== $existing && $existing->transaction_journal_id !== $journal->id) {
+            return $this->describe($existing);
+        }
+        if (null !== $existing) {
+            // keyed query-builder update: the table has a composite key, so Model::update() would
+            // emit "where id is null" (500 on Postgres, silent no-op on SQLite). Never call
+            // save()/update()/delete() on a PlaidTransactionLink instance.
+            // conditioned on the journal still owning the row (R2-4): a concurrent move makes this match 0 rows.
+            $changed = PlaidTransactionLink::where($key)->where('transaction_journal_id', $journal->id)->update($attributes);
+            if (1 === $changed) {
+                return null;
+            }
+            $now = PlaidTransactionLink::where($key)->first();
+            if (null !== $now) {
+                return $this->describe($now);
+            }
+
+            // the row vanished under us: fall through and insert it.
+        }
+
+        try {
+            // savepoint: on Postgres a failed insert would otherwise poison the whole transaction.
+            DB::transaction(static function () use ($key, $attributes): void {
+                PlaidTransactionLink::create($key + $attributes);
+            });
+        } catch (UniqueConstraintViolationException) {
+            // lost a race with a concurrent request that committed the same id first.
+            $winner = PlaidTransactionLink::where($key)->first();
+            if (null !== $winner && $winner->transaction_journal_id === $journal->id) {
+                // a concurrent identical request already wrote what we wanted: desired state holds (R2-6a).
+                return $this->writeLink($groupId, $journal, $link, true);
+            }
+            if (null === $winner && !$retried && 'mysql' !== DB::connection()->getDriverName()) {
+                // the winner was deleted again before we could read it: the id is free, try once more (R2-6b).
+                return $this->writeLink($groupId, $journal, $link, true);
+            }
+
+            // on MySQL (REPEATABLE READ) the winner may be invisible to this snapshot: still answer 409.
+            return null === $winner
+                ? ['plaid_transaction_id' => $link['plaid_transaction_id'], 'transaction_journal_id' => null, 'transaction_group_id' => null, 'leg' => $link['leg']]
+                : $this->describe($winner);
+        }
+
+        return null;
     }
 
     /**
