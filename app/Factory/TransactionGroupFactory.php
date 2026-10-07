@@ -66,16 +66,8 @@ class TransactionGroupFactory
 
         // journals, group and Plaid links are written in one database transaction.
         return DB::transaction(function () use ($data): TransactionGroup {
-            $ids = [];
-            foreach ($data['transactions'] ?? [] as $row) {
-                if (is_array($row['plaid_links'] ?? null)) {
-                    $ids = array_merge($ids, array_column($row['plaid_links'], 'plaid_transaction_id'));
-                }
-            }
-            if ([] !== $ids) {
-                // one lock order across ALL splits of the request (R2-5)
-                app(PlaidLinkService::class)->lockIds((int) $data['user_group']->id, $ids);
-            }
+            // one lock order across ALL splits of the request (R2-5)
+            app(PlaidLinkService::class)->lockRequest((int) $data['user_group']->id, $data['transactions'] ?? []);
 
             try {
                 $collection = $this->journalFactory->create($data);

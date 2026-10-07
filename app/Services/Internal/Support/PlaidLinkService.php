@@ -68,6 +68,27 @@ class PlaidLinkService
     }
 
     /**
+     * Collect the Plaid ids of all submitted splits and lock them (see lockIds). Returns whether the request carries any.
+     *
+     * @param array<int, array<string, mixed>> $splits
+     */
+    public function lockRequest(int $groupId, array $splits): bool
+    {
+        $ids = [];
+        foreach ($splits as $split) {
+            if (is_array($split['plaid_links'] ?? null)) {
+                $ids = array_merge($ids, array_column($split['plaid_links'], 'plaid_transaction_id'));
+            }
+        }
+        if ([] === $ids) {
+            return false;
+        }
+        $this->lockIds($groupId, $ids);
+
+        return true;
+    }
+
+    /**
      * Take a transaction-scoped Postgres advisory lock for every Plaid id of a whole request, in sorted order,
      * before any link row is touched. Two requests with the same ids in opposite order across splits then queue
      * instead of deadlocking (R2-5). Other drivers: no-op. Call inside the database transaction.

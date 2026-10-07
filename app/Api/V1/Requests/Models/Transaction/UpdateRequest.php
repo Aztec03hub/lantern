@@ -237,6 +237,19 @@ class UpdateRequest extends FormRequest
             // if more than one, verify that there are journal ID's present.
             $this->validateJournalIds($validator, $transactionGroup);
 
+            // each split may name a transaction_journal_id only once (otherwise the last write wins silently)
+            $seen = [];
+            foreach ($this->getTransactionsArray($validator) as $i => $split) {
+                $jid = $split['transaction_journal_id'] ?? null;
+                if (null === $jid) {
+                    continue;
+                }
+                if (in_array((string) $jid, $seen, true)) {
+                    $validator->errors()->add(sprintf('transactions.%d.transaction_journal_id', $i), 'Each split may appear only once.');
+                }
+                $seen[] = (string) $jid;
+            }
+
             // if more than one split, needs group title
             $this->validateGroupDescription($validator);
 

@@ -115,6 +115,19 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame(3, PlaidTransactionLink::count());
     }
 
+    public function testSameJournalTwiceInOnePutIs422(): void
+    {
+        [$group, $holder] = $this->splitGroup();
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), [
+            'group_title'  => 'g',
+            'transactions' => [
+                ['transaction_journal_id' => $holder, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+                ['transaction_journal_id' => $holder, 'plaid_links' => []],
+            ],
+        ])->assertStatus(422);
+        $this->assertSame($holder, (int) PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
+    }
+
     public function testUpdateWithoutPlaidLinksKeepsThem(): void
     {
         $a = $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->json('data.id');
@@ -290,6 +303,9 @@ final class PlaidLinkTest extends TestCase
     /** An FK violation must not be reported as "already imported" (409 means a different transaction only). */
     public function testForeignKeyViolationIsNotAConflict(): void
     {
+        if ('pgsql' !== \Illuminate\Support\Facades\DB::connection()->getDriverName()) {
+            $this->markTestSkipped('SQLite connection has no FK enforcement in Firefly config');
+        }
         $journal                = new TransactionJournal();
         $journal->id            = 987654;
         $journal->user_group_id = $this->user->user_group_id;

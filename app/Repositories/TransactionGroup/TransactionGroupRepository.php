@@ -391,20 +391,13 @@ class TransactionGroupRepository implements TransactionGroupRepositoryInterface,
 
         return DB::transaction(static function () use ($service, $transactionGroup, $data): TransactionGroup {
             $splits = $data['transactions'] ?? [];
-            $ids    = [];
-            foreach ($splits as $split) {
-                if (is_array($split['plaid_links'] ?? null)) {
-                    $ids = array_merge($ids, array_column($split['plaid_links'], 'plaid_transaction_id'));
-                }
-            }
-            if ([] !== $ids) {
-                $plaid      = app(PlaidLinkService::class);
+            $plaid  = app(PlaidLinkService::class);
+            if ($plaid->lockRequest((int) $transactionGroup->user_group_id, $splits)) {
                 $journalIds = $transactionGroup->transactionJournals()->pluck('id')->map(static fn ($id): int => (int) $id)->all();
                 // a single submitted split of a single-journal group needs no transaction_journal_id.
                 if (1 === count($splits) && 1 === count($journalIds)) {
                     $splits[array_key_first($splits)]['transaction_journal_id'] ??= $journalIds[0];
                 }
-                $plaid->lockIds((int) $transactionGroup->user_group_id, $ids);
                 $plaid->releaseMovedIds((int) $transactionGroup->user_group_id, $journalIds, $splits);
             }
 
