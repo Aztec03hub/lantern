@@ -136,7 +136,10 @@ abstract class PairTestCase extends TestCase
     {
         $journal = TransactionJournal::where('transaction_group_id', $group)->orderBy('id')->firstOrFail();
 
-        return ['group' => $group, 'journal' => (int) $journal->id, 'at' => $journal->updated_at->toAtomString()];
+        $groupAt = \Carbon\Carbon::parse(\Illuminate\Support\Facades\DB::table('transaction_groups')->where('id', $group)->value('updated_at'));
+
+        // The version a client sees: the later of the journal's and the group's stamp (PairMergeService::refuseIfStale)
+        return ['group' => $group, 'journal' => (int) $journal->id, 'at' => max($journal->updated_at, $groupAt)->toAtomString()];
     }
 
     /** Two singles that form a transfer: money out of $from, money into $to. */

@@ -249,6 +249,15 @@ final class PairMergeTest extends PairTestCase
         $this->assertSame('edited', TransactionJournal::find($keep['journal'])->description);
     }
 
+    /** Real data: a PUT left the group one second ahead of its journal; the group's stamp (what the API shows) is current. */
+    public function testGroupStampASecondAheadOfItsJournalIsNotStale(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $groupAt      = TransactionJournal::find($keep['journal'])->updated_at->copy()->addSecond();
+        \Illuminate\Support\Facades\DB::table('transaction_groups')->where('id', $keep['group'])->update(['updated_at' => $groupAt->toDateTimeString()]);
+        $this->merge(['at' => $groupAt->toAtomString()] + $keep, $abs)->assertOk();
+    }
+
     // ---------------------------------------------------------------- 3: 409 reasons
 
     public function testSplitJournalIsNotSingle(): void

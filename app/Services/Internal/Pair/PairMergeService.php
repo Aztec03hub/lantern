@@ -357,8 +357,13 @@ class PairMergeService
     /** @throws PairRefusedException */
     private function refuseIfStale(int $journalId, string $sent): void
     {
-        $stored = DB::table('transaction_journals')->where('id', $journalId)->value('updated_at');
-        if (null === $stored || Carbon::parse($sent)->getTimestamp() !== Carbon::parse($stored)->getTimestamp()) {
+        // The version is the later of the journal's and its group's updated_at: some PUTs bump only the group, and a PUT
+        // can leave the group a second ahead of its journal. The API shows the group's stamp, which is that later one.
+        $row = DB::table('transaction_journals')
+            ->join('transaction_groups', 'transaction_groups.id', '=', 'transaction_journals.transaction_group_id')
+            ->where('transaction_journals.id', $journalId)
+            ->first(['transaction_journals.updated_at as journal_at', 'transaction_groups.updated_at as group_at']);
+        if (null === $row || Carbon::parse($sent)->getTimestamp() !== max(Carbon::parse($row->journal_at)->getTimestamp(), Carbon::parse($row->group_at)->getTimestamp())) {
             throw new PairRefusedException(409, 'stale');
         }
     }
