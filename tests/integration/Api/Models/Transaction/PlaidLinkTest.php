@@ -394,8 +394,26 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame($j2, (int) PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
     }
 
-    /** R2-6a: an identical concurrent request wrote the same row first: desired state holds, no conflict. */
+    /** R2-6a: an identical concurrent request wrote the same row for THIS journal first: desired state holds, no conflict. */
     public function testRaceLoserWhoseDesiredStateHoldsSucceeds(): void
+    {
+        [, , $j2] = $this->splitGroup();
+        $gid      = $this->user->user_group_id;
+        $injected = false;
+        \Illuminate\Support\Facades\DB::listen(static function ($q) use (&$injected, $gid, $j2): void {
+            // right after the existence check returned nothing, the "other request" commits the same row.
+            if (!$injected && str_starts_with(strtolower($q->sql), 'select') && str_contains($q->sql, 'plaid_transaction_links')) {
+                $injected = true;
+                \Illuminate\Support\Facades\DB::table('plaid_transaction_links')->insert(['user_group_id' => $gid, 'plaid_transaction_id' => 'R1', 'transaction_journal_id' => $j2, 'leg' => 'single']);
+            }
+        });
+        app(PlaidLinkService::class)->sync(TransactionJournal::find($j2), [['plaid_transaction_id' => 'R1', 'leg' => 'single', 'plaid_account_id' => 'pa']]);
+        $this->assertSame('pa', PlaidTransactionLink::where('plaid_transaction_id', 'R1')->value('plaid_account_id'));
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'R1')->count());
+    }
+
+    /** R2-6b: the winner vanishes (its insert is rolled back) before the loser re-reads: the id is free, retry, no 409. */
+    public function testRaceLoserWhoseWinnerVanishedRetries(): void
     {
         [, , $j2] = $this->splitGroup();
         $gid      = $this->user->user_group_id;
@@ -403,12 +421,12 @@ final class PlaidLinkTest extends TestCase
             static $done = false;
             if (!$done) {
                 $done = true;
-                \Illuminate\Support\Facades\DB::table('plaid_transaction_links')->insert(['user_group_id' => $gid, 'plaid_transaction_id' => 'R1', 'transaction_journal_id' => $j2, 'leg' => 'single']);
+                // inside the savepoint: the failed insert rolls this row back too, so the re-read finds nothing.
+                \Illuminate\Support\Facades\DB::table('plaid_transaction_links')->insert(['user_group_id' => $gid, 'plaid_transaction_id' => 'R2', 'transaction_journal_id' => $j2, 'leg' => 'single']);
             }
         });
-        app(PlaidLinkService::class)->sync(TransactionJournal::find($j2), [['plaid_transaction_id' => 'R1', 'leg' => 'single', 'plaid_account_id' => 'pa']]);
-        $this->assertSame('pa', PlaidTransactionLink::where('plaid_transaction_id', 'R1')->value('plaid_account_id'));
-        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'R1')->count());
+        app(PlaidLinkService::class)->sync(TransactionJournal::find($j2), [['plaid_transaction_id' => 'R2', 'leg' => 'single', 'plaid_account_id' => null]]);
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'R2')->count());
     }
 
     /** leg is constrained in the database (3c4ea5154d). */
