@@ -128,6 +128,42 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame($holder, (int) PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
     }
 
+    /** R4: spellings that Firefly casts to the same journal (int) must count as the same journal; an array is a 422, not a 500. */
+    public function testSameJournalSpelledDifferentlyIs422(): void
+    {
+        [$group, $holder] = $this->splitGroup();
+        $status = [];
+        foreach ([$holder, '0'.$holder, $holder.'.0', '+'.$holder, ' '.$holder, [$holder]] as $spelling) {
+            $status[var_export($spelling, true)] = $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), [
+                'group_title'  => 'g',
+                'transactions' => [
+                    ['transaction_journal_id' => (string) $holder, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+                    ['transaction_journal_id' => $spelling, 'plaid_links' => []],
+                ],
+            ])->status();
+            $status[var_export($spelling, true)] .= ' M1@'.PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id');
+        }
+        $this->assertSame(array_fill_keys(array_keys($status), '422 M1@'.$holder), $status);
+    }
+
+    /** R4: transaction_journal_id 0 means "new split" in Firefly, so two new splits are not duplicates. */
+    public function testTwoNewSplitsWithJournalIdZeroAreAllowed(): void
+    {
+        [$group, $holder, $other] = $this->splitGroup();
+        $new = $this->payload('N1')['transactions'][0];
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), [
+            'group_title'  => 'g',
+            'transactions' => [
+                ['transaction_journal_id' => $holder],
+                ['transaction_journal_id' => $other],
+                ['transaction_journal_id' => 0] + $new,
+                ['transaction_journal_id' => 0, 'plaid_links' => [['plaid_transaction_id' => 'N2', 'leg' => 'single']]] + $new,
+            ],
+        ])->assertOk();
+        $this->assertSame(4, TransactionJournal::where('transaction_group_id', $group)->count());
+        $this->assertSame(3, PlaidTransactionLink::count());
+    }
+
     public function testUpdateWithoutPlaidLinksKeepsThem(): void
     {
         $a = $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->json('data.id');
