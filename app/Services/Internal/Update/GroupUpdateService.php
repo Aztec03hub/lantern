@@ -32,6 +32,7 @@ use FireflyIII\Factory\TransactionJournalFactory;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Services\Internal\Destroy\JournalDestroyService;
+use FireflyIII\Services\Internal\Pair\PairMergeService;
 use FireflyIII\Support\Facades\Preferences;
 use Illuminate\Support\Facades\Log;
 
@@ -163,7 +164,11 @@ class GroupUpdateService
         $updateService->setTransactionGroup($transactionGroup);
         $updateService->setTransactionJournal($journal);
         $updateService->setData($data);
+        $previous = $journal->updated_at;
         $updateService->update();
+        // every edit moves the journal's version stamp, also edits that only touch tags, notes or the category
+        // (a pair merge compares this stamp, see PairMergeService::nextVersion).
+        PairMergeService::bumpJournalVersion((int) $journal->id, $previous);
     }
 
     /**

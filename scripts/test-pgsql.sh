@@ -15,7 +15,7 @@ docker run -d --name "$NAME-db" --network "$NAME" -e POSTGRES_PASSWORD=t -e POST
   postgres:16-alpine -c fsync=off >/dev/null
 until docker exec "$NAME-db" pg_isready -U postgres -d firefly >/dev/null 2>&1; do sleep 0.2; done
 ARGS=("$@")
-[ ${#ARGS[@]} -eq 0 ] && ARGS=(--filter 'PlaidLink|PlaidAccountDelete' tests/integration)
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(--filter 'PlaidLink|PlaidAccountDelete|PairMerge|PairConcurrency' tests/integration)
 mkdir -p bootstrap/cache .phpunit.cache storage/framework/{cache,sessions,views} storage/logs storage/database
 docker run --rm --user "$(id -u):$(id -g)" --network "$NAME" -v "$PWD":/var/www/html -w /var/www/html \
   -e DB_CONNECTION=pgsql -e DB_HOST="$NAME-db" -e DB_PORT=5432 -e DB_DATABASE=firefly -e DB_USERNAME=postgres -e DB_PASSWORD=t -e APP_KEY=SomeRandomStringOf32CharsExactly \

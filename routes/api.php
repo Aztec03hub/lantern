@@ -605,6 +605,8 @@ Route::group(
     ],
     static function (): void {
         Route::get('', ['uses' => 'PlaidLinkController@index', 'as' => 'index']);
+        Route::post('pair', ['uses' => 'PairController@store', 'as' => 'pair.store']);
+        Route::delete('pair/{pairMerge}', ['uses' => 'PairController@destroy', 'as' => 'pair.destroy'])->where('pairMerge', '[0-9]+');
     }
 );
 
