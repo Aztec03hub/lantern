@@ -603,10 +603,14 @@ final class PairMergeTest extends PairTestCase
         $before = $this->dump();
         $id     = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
         $this->assertNotEquals($before['transaction_journals'], $this->dump()['transaction_journals']);
+        $noteOf   = static fn (int $journal) => DB::table('notes')->where('noteable_id', $journal)->whereNull('deleted_at')->value('text');
+        $this->assertStringContainsString('abs note', (string) $noteOf($keep['journal']), 'the merge must have changed keep\'s note');
         $response = $this->unmerge($id);
         $response->assertOk();
         $response->assertJsonPath('data.pair_merge_id', $id);
         $this->assertNotNull($response->json('data.unmerged_at'));
+        $this->assertSame('keep note', $noteOf($keep['journal']), 'unmerge must restore keep\'s own note text');
+        $this->assertSame('abs note', $noteOf($abs['journal']));
         $this->assertDumpsEqual($before, $this->dump());
         $this->assertNotNull(PairMerge::find($id)->unmerged_at);
         $this->assertSame(['OUT1' => 'single'], $this->linkLegs($keep['journal']));
