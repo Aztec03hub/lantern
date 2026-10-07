@@ -340,6 +340,77 @@ final class PlaidLinkTest extends TestCase
         $this->assertSame('mine', PlaidTransactionLink::where('user_group_id', $this->user->user_group_id)->where('plaid_transaction_id', 'M1')->value('plaid_account_id'));
     }
 
+    /** Update: the Postgres advisory locks cover every id of the request, sorted (R2-5). */
+    public function testAdvisoryLocksOnUpdateAreSorted(): void
+    {
+        if ('pgsql' !== \Illuminate\Support\Facades\DB::connection()->getDriverName()) {
+            $this->markTestSkipped('advisory locks are Postgres only');
+        }
+        [$group, $holder, $other] = $this->splitGroup();
+        $locks = [];
+        \Illuminate\Support\Facades\DB::listen(static function ($q) use (&$locks): void {
+            if (str_contains($q->sql, 'pg_advisory_xact_lock')) {
+                $locks[] = $q->bindings[0];
+            }
+        });
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['group_title' => 'split', 'transactions' => [
+            ['transaction_journal_id' => (string) $holder, 'plaid_links' => [['plaid_transaction_id' => 'M1', 'leg' => 'single']]],
+            ['transaction_journal_id' => (string) $other, 'plaid_links' => [['plaid_transaction_id' => 'B2', 'leg' => 'single'], ['plaid_transaction_id' => 'A0', 'leg' => 'single']]],
+        ]])->assertOk();
+        $gid = $this->user->user_group_id;
+        $this->assertSame([$gid.':A0', $gid.':B2', $gid.':M1'], $locks);
+    }
+
+    /** Update adding NEW splits: conflicts of every new split are listed. */
+    public function testUpdateNewSplitsConflictsAreAllListed(): void
+    {
+        $this->postJson(route('api.v1.transactions.store'), $this->twoLegPayload('C1', 'C2'))->assertOk();
+        [$group] = $this->splitGroup();
+        $new1    = $this->payload('unused')['transactions'][0];
+        $new2    = $new1;
+        $new1['plaid_links'] = [['plaid_transaction_id' => 'C1', 'leg' => 'single']];
+        $new2['plaid_links'] = [['plaid_transaction_id' => 'C2', 'leg' => 'single']];
+        $res = $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $group]), ['group_title' => 'split', 'transactions' => [$new1, $new2]])->assertStatus(409);
+        $this->assertEqualsCanonicalizing(['C1', 'C2'], array_column($res->json('conflicts'), 'plaid_transaction_id'));
+    }
+
+    /** R2-4: the row is moved to another journal between the read and the keyed update: no theft, a conflict. */
+    public function testKeyedUpdateDoesNotStealARowMovedUnderIt(): void
+    {
+        [, $j1, $j2] = $this->splitGroup();   // M1 sits on j1
+        $moved       = false;
+        \Illuminate\Support\Facades\DB::listen(function ($q) use (&$moved, $j2): void {
+            if (!$moved && str_starts_with(strtolower($q->sql), 'select') && str_contains($q->sql, 'plaid_transaction_links')) {
+                $moved = true;
+                \Illuminate\Support\Facades\DB::table('plaid_transaction_links')->where('plaid_transaction_id', 'M1')->update(['transaction_journal_id' => $j2]);
+            }
+        });
+        try {
+            app(PlaidLinkService::class)->sync(TransactionJournal::find($j1), [['plaid_transaction_id' => 'M1', 'leg' => 'source', 'plaid_account_id' => null]]);
+            $this->fail('expected a conflict');
+        } catch (PlaidLinkConflictException $e) {
+            $this->assertSame($j2, $e->conflicts[0]['transaction_journal_id']);
+        }
+        $this->assertSame($j2, (int) PlaidTransactionLink::where('plaid_transaction_id', 'M1')->value('transaction_journal_id'));
+    }
+
+    /** R2-6a: an identical concurrent request wrote the same row first: desired state holds, no conflict. */
+    public function testRaceLoserWhoseDesiredStateHoldsSucceeds(): void
+    {
+        [, , $j2] = $this->splitGroup();
+        $gid      = $this->user->user_group_id;
+        PlaidTransactionLink::creating(static function (PlaidTransactionLink $l) use ($j2, $gid): void {
+            static $done = false;
+            if (!$done) {
+                $done = true;
+                \Illuminate\Support\Facades\DB::table('plaid_transaction_links')->insert(['user_group_id' => $gid, 'plaid_transaction_id' => 'R1', 'transaction_journal_id' => $j2, 'leg' => 'single']);
+            }
+        });
+        app(PlaidLinkService::class)->sync(TransactionJournal::find($j2), [['plaid_transaction_id' => 'R1', 'leg' => 'single', 'plaid_account_id' => 'pa']]);
+        $this->assertSame('pa', PlaidTransactionLink::where('plaid_transaction_id', 'R1')->value('plaid_account_id'));
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'R1')->count());
+    }
+
     /** leg is constrained in the database (3c4ea5154d). */
     public function testLegColumnIsAnEnum(): void
     {
