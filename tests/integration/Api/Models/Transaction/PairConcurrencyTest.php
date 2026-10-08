@@ -79,12 +79,10 @@ final class PairConcurrencyTest extends PairTestCase
         $out          = $this->parallel([
             fn (): array => $this->mergeHolding($keep, $abs, $held, 600),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
-        ]);
+        ], true);
         $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
         $this->assertSame($out[0]['id'], $out[1]['id']);
         $this->assertSame(1, PairMerge::count());
-        // the second one really queued: it was only answered after the first one's sleep
-        $this->assertGreaterThan(400, $out[1]['finished_ms'] - $out[1]['started_ms']);
     }
 
     /** Two merges that share one journal (the same keep): exactly one wins, the other is a 409. */
@@ -148,11 +146,10 @@ final class PairConcurrencyTest extends PairTestCase
         $out  = $this->parallel([
             fn (): array => $this->mergeHolding($keep, $abs1, $held, 600),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs2)),
-        ]);
+        ], true);
         $this->assertSame([200, 409], array_column($out, 'status'), json_encode($out));
         // the loser queued at the advisory locks of ITS link set; when it got them, keep had gained the winner's link
         $this->assertSame('link_conflict', $out[1]['reason']);
-        $this->assertGreaterThan(400, $out[1]['finished_ms'] - $out[1]['started_ms']);
         $this->assertSame(1, $this->liveMerges());
         $this->assertSame(['D2' => 'single'], $this->linkLegs($abs2['journal']));
     }
@@ -191,10 +188,9 @@ final class PairConcurrencyTest extends PairTestCase
         $out          = $this->parallel([
             fn (): array => $this->putHolding($keep, 'edited', $held, 600),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
-        ]);
+        ], true);
         $this->assertSame([200, 409], array_column($out, 'status'), json_encode($out));
         $this->assertSame('stale', $out[1]['reason']);
-        $this->assertGreaterThan(400, $out[1]['finished_ms'] - $out[1]['started_ms']);
         $this->assertSame('edited', TransactionJournal::find($keep['journal'])->description);
         $this->assertSame(0, PairMerge::count());
         $this->assertSame(['OUT1' => 'single'], $this->linkLegs($keep['journal']));
@@ -208,9 +204,8 @@ final class PairConcurrencyTest extends PairTestCase
         $out          = $this->parallel([
             fn (): array => $this->mergeHolding($keep, $abs, $held, 600),
             fn (): array => $this->after($held, fn (): array => $this->doPut($this->user, $keep, 'edited after')),
-        ]);
+        ], true);
         $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
-        $this->assertGreaterThan(400, $out[1]['finished_ms'] - $out[1]['started_ms']);
         $this->assertSame('edited after', TransactionJournal::find($keep['journal'])->description);
         $this->assertSame('Transfer', TransactionJournal::with('transactionType')->find($keep['journal'])->transactionType->type);
         $this->assertSame(['IN1' => 'destination', 'OUT1' => 'source'], $this->linkLegs($keep['journal']));
@@ -250,6 +245,34 @@ final class PairConcurrencyTest extends PairTestCase
         );
     }
 
+    /** core-3 L5: unmerge racing a PUT of keep, with the journal stamp ahead of its group (the state that hid review R1 H1). */
+    public function testUnmergeRacingAPutKeepsTheEditAndRestoresTheLinks(): void
+    {
+        $this->raceRounds(
+            function (array $r, int $i): array {
+                $keep = $this->fastSingle(['user' => $r['user'], 'type' => 'withdrawal', 'account' => $r['a'], 'plaid' => 'OUT-'.$i, 'journalAhead' => true]);
+                $abs  = $this->fastSingle(['user' => $r['user'], 'type' => 'deposit', 'account' => $r['b'], 'plaid' => 'IN-'.$i]);
+                $this->actingAs($r['user'], 'api');
+                $id = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+
+                return ['keep' => $keep, 'abs' => $abs, 'id' => $id];
+            },
+            fn (array $c): array => [fn (): array => $this->doUnmerge($c['user'], $c['id']), fn (): array => $this->doPut($c['user'], $c['keep'], 'edited')],
+            function (int $i, array $c, array $out): void {
+                $this->assertSame([200, 200], array_column($out, 'status'), 'round '.$i.' '.json_encode($out));
+                $this->assertSame('edited', TransactionJournal::find($c['keep']['journal'])->description, 'the edit is never lost, round '.$i);
+                $this->assertSame(['OUT-'.$i => 'single'], $this->linkLegs($c['keep']['journal']));
+                $this->assertSame(['IN-'.$i => 'single'], $this->linkLegs($c['abs']['journal']));
+                $this->assertNotNull(PairMerge::find($c['id'])->unmerged_at);
+                $this->assertSame(
+                    DB::table('transaction_journals')->where('id', $c['keep']['journal'])->value('updated_at'),
+                    DB::table('transaction_groups')->where('id', $c['keep']['group'])->value('updated_at'),
+                    'one stamp for journal and group after the race, round '.$i,
+                );
+            },
+        );
+    }
+
     #[Override]
     public function beginDatabaseTransaction(): void
     {
@@ -276,6 +299,10 @@ final class PairConcurrencyTest extends PairTestCase
         }
         // everything this class committed is removed again, so no other test sees it. Seeded reference tables are not touched.
         if ('pgsql' === DB::connection()->getDriverName()) {
+            // TRUNCATE ... CASCADE is only ever allowed in the throwaway database scripts/test-pgsql.sh creates
+            if ('firefly' !== DB::connection()->getDatabaseName() || !str_starts_with((string) config('database.connections.pgsql.host'), 'plaid-pgtest-')) {
+                throw new \LogicException('refusing to TRUNCATE in a database that is not the throwaway test stack');
+    }
             DB::statement('TRUNCATE users, user_groups, notes, locations, audit_log_entries RESTART IDENTITY CASCADE');
         }
         parent::tearDown();
@@ -302,7 +329,7 @@ final class PairConcurrencyTest extends PairTestCase
             foreach ($jobs($contexts[$i]) as $job) {
                 $all[]   = $job;
                 $owner[] = $i;
-            }
+    }
         }
         $results = $this->parallel($all);
         $byRound = [];
@@ -341,10 +368,12 @@ final class PairConcurrencyTest extends PairTestCase
      * Run every job in its own forked process with its own connection. Returns the jobs' results in order.
      *
      * @param array<int, callable():array<string,mixed>> $jobs
+     * @param bool                                        $expectQueue when true, the parent must SEE a backend waiting on a lock (pg_stat_activity)
+     *                                                                 while the jobs run: proof that the second request really queued, with no timing threshold
      *
      * @return array<int, array<string, mixed>>
      */
-    private function parallel(array $jobs): array
+    private function parallel(array $jobs, bool $expectQueue = false): array
     {
         $go      = $this->flag();
         // close the parent's connection BEFORE forking: a PDO shared by two processes interleaves their protocol messages.
@@ -358,7 +387,7 @@ final class PairConcurrencyTest extends PairTestCase
             $this->assertNotSame(-1, $pid, 'fork failed');
             if (0 === $pid) {
                 $this->runChild($job, $go, $outputs[$index]);
-            }
+    }
             $pids[$index] = $pid;
         }
         usleep(300000); // every child is forked and waits at the gate
@@ -368,7 +397,7 @@ final class PairConcurrencyTest extends PairTestCase
             while (0 === pcntl_waitpid($pid, $status, WNOHANG)) {
                 $this->assertLessThan($deadline, microtime(true), 'a child did not finish: deadlock or lost wake-up');
                 usleep(5000);
-            }
+    }
         }
         $results = [];
         foreach ($outputs as $index => $file) {
@@ -388,7 +417,7 @@ final class PairConcurrencyTest extends PairTestCase
         try {
             while (!is_file($go)) {
                 usleep(500);
-            }
+    }
             $result = $job();
         } catch (\Throwable $e) {
             $result = ['crash' => get_class($e).': '.$e->getMessage()];

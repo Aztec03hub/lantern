@@ -25,6 +25,7 @@ namespace Tests\integration\Api\Models\Transaction;
 
 use FireflyIII\Enums\AccountTypeEnum;
 use FireflyIII\Models\Account;
+use FireflyIII\Models\PairMerge;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\User;
 use Illuminate\Support\Facades\DB;
@@ -44,7 +45,7 @@ abstract class PairTestCase extends TestCase
     protected const array TOUCHED = [
         'transaction_groups', 'transaction_journals', 'transactions', 'journal_meta', 'notes', 'locations', 'audit_log_entries',
         'tag_transaction_journal', 'category_transaction_journal', 'budget_transaction_journal', 'journal_links',
-        'plaid_transaction_links', 'tags', 'categories', 'budgets', 'bills', 'attachments', 'piggy_bank_events',
+        'plaid_transaction_links', 'tags', 'categories', 'budgets', 'bills', 'attachments', 'piggy_bank_events', 'accounts',
     ];
 
     protected Account $assetA;
@@ -90,7 +91,7 @@ abstract class PairTestCase extends TestCase
      * The same as single(), but with raw inserts: about 50 times faster, for the concurrency rounds that need hundreds
      * of journals. The rows are the ones the API writes (checked by every other test through single()).
      *
-     * @param array<string, mixed> $o type, account, plaid, amount, description, user (default: the test user)
+     * @param array<string, mixed> $o type, account, plaid, amount, description, user (default: the test user), journalAhead (journal stamp one second past its group's)
      *
      * @return array{group: int, journal: int, at: string}
      */
@@ -106,10 +107,11 @@ abstract class PairTestCase extends TestCase
         $amount   = $o['amount'] ?? '25.00';
         $desc     = $o['description'] ?? ($type.' '.$o['plaid']);
         $group    = DB::table('transaction_groups')->insertGetId(['user_id' => $uid, 'user_group_id' => $ugid, 'title' => null, 'created_at' => $now, 'updated_at' => $now]);
+        $ahead    = ($o['journalAhead'] ?? false) ? now()->addSecond()->toDateTimeString() : $now;
         $journal  = DB::table('transaction_journals')->insertGetId([
             'user_id' => $uid, 'user_group_id' => $ugid, 'transaction_group_id' => $group, 'transaction_type_id' => 'withdrawal' === $type ? 7 : 1,
             'transaction_currency_id' => $currency, 'description' => $desc, 'date' => '2026-10-01 00:00:00', 'date_tz' => 'UTC', 'order' => 0, 'tag_count' => 0,
-            'encrypted' => false, 'completed' => true, 'created_at' => $now, 'updated_at' => $now,
+            'encrypted' => false, 'completed' => true, 'created_at' => $now, 'updated_at' => $ahead,
         ]);
         $own      = $o['account']->id;
         $other    = 'withdrawal' === $type ? $counter['expense'] : $counter['revenue'];
@@ -120,7 +122,8 @@ abstract class PairTestCase extends TestCase
         }
         DB::table('plaid_transaction_links')->insert(['user_group_id' => $ugid, 'plaid_transaction_id' => $o['plaid'], 'transaction_journal_id' => $journal, 'leg' => 'single', 'plaid_account_id' => 'pa-'.$o['plaid'], 'created_at' => $now, 'updated_at' => $now]);
 
-        return $this->ref($group);
+        // no API round trip here (hundreds of rows); the stamps of journal and group are identical by construction
+        return ['group' => $group, 'journal' => $journal, 'at' => $this->serverVersion($group)];
     }
 
     /** @return array{expense: int, revenue: int} */
@@ -131,15 +134,52 @@ abstract class PairTestCase extends TestCase
         return ['expense' => $make('Expense account', 'Shop'), 'revenue' => $make('Revenue account', 'Payer')];
     }
 
-    /** @return array{group: int, journal: int, at: string} */
+    /**
+     * The group as a client sees it: the stamp comes from GET /api/v1/transactions/{id}, exactly what the connector
+     * sends back, NOT from the database with the service's own rule (that mirror hid review R1 core-1 H1).
+     *
+     * @return array{group: int, journal: int, at: string}
+     */
     protected function ref(int $group): array
     {
         $journal = TransactionJournal::where('transaction_group_id', $group)->orderBy('id')->firstOrFail();
+        $stamp   = (string) $this->getJson(route('api.v1.transactions.show', ['transactionGroup' => $group]))->assertOk()->json('data.attributes.updated_at');
 
-        $groupAt = \Carbon\Carbon::parse(\Illuminate\Support\Facades\DB::table('transaction_groups')->where('id', $group)->value('updated_at'));
+        return ['group' => $group, 'journal' => (int) $journal->id, 'at' => $stamp];
+    }
 
-        // The version a client sees: the later of the journal's and the group's stamp (PairMergeService::refuseIfStale)
-        return ['group' => $group, 'journal' => (int) $journal->id, 'at' => max($journal->updated_at, $groupAt)->toAtomString()];
+    /** The stamp the SERVER holds for a group's journal (later of journal and group), for assertions about stored stamps. */
+    protected function serverVersion(int $group): string
+    {
+        $journal = TransactionJournal::where('transaction_group_id', $group)->orderBy('id')->firstOrFail();
+
+        return (string) \FireflyIII\Services\Internal\Pair\PairMergeService::versionOf((int) $journal->id)?->toAtomString();
+    }
+
+    /**
+     * updated_at of every group and journal, keyed by table:id, for "the version never goes backwards" assertions.
+     *
+     * @return array<string, int>
+     */
+    protected function stamps(): array
+    {
+        $out = [];
+        foreach (['transaction_groups', 'transaction_journals'] as $table) {
+            foreach (DB::table($table)->get(['id', 'updated_at']) as $row) {
+                $out[$table.':'.$row->id] = \Carbon\Carbon::parse($row->updated_at)->getTimestamp();
+            }
+        }
+
+        return $out;
+    }
+
+    /** @param array<string, int> $before */
+    protected function assertStampsNotOlder(array $before, string $message = ''): void
+    {
+        $now = $this->stamps();
+        foreach ($before as $key => $stamp) {
+            $this->assertGreaterThanOrEqual($stamp, $now[$key] ?? $stamp, trim($message.' '.$key.' went back in time'));
+        }
     }
 
     /** Two singles that form a transfer: money out of $from, money into $to. */
@@ -202,9 +242,23 @@ abstract class PairTestCase extends TestCase
     /** Compare two dumps and name the first table that differs (a readable failure). */
     protected function assertDumpsEqual(array $expected, array $actual, string $message = ''): void
     {
+        // strict and type-exact: both sides go through json so "1", 1 and true are different, only key order is free
+        $norm = static fn (array $rows): array => json_decode((string) json_encode($rows), true);
         foreach ($expected as $table => $rows) {
-            $this->assertEquals($rows, $actual[$table], trim($message.' table '.$table));
+            $this->assertSame($norm($rows), $norm($actual[$table]), trim($message.' table '.$table));
         }
+    }
+
+    /**
+     * @param array{group: int, journal: int, at: string} $keep
+     * @param array{group: int, journal: int, at: string} $abs
+     */
+    protected function assertRefused(int $status, string $reason, array $keep, array $abs): void
+    {
+        $before = $this->dump();
+        $this->merge($this->ref($keep['group']), $this->ref($abs['group']))->assertStatus($status)->assertJsonPath('reason', $reason);
+        $this->assertDumpsEqual($before, $this->dump(), $reason);
+        $this->assertSame(0, PairMerge::count());
     }
 
     protected function budgets(string ...$names): void
@@ -239,9 +293,9 @@ abstract class PairTestCase extends TestCase
         parent::setUp();
         $this->user   = $this->createAuthenticatedUser();
         $this->actingAs($this->user, 'api');
-        $this->assetA = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset A']);
-        $this->assetB = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset B']);
-        $this->loanA  = Account::factory()->for($this->user)->withType(AccountTypeEnum::LOAN)->create(['name' => 'Loan A']);
-        $this->loanB  = Account::factory()->for($this->user)->withType(AccountTypeEnum::LOAN)->create(['name' => 'Loan B']);
+        $this->assetA = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset A', 'user_group_id' => $this->user->user_group_id]);
+        $this->assetB = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset B', 'user_group_id' => $this->user->user_group_id]);
+        $this->loanA  = Account::factory()->for($this->user)->withType(AccountTypeEnum::LOAN)->create(['name' => 'Loan A', 'user_group_id' => $this->user->user_group_id]);
+        $this->loanB  = Account::factory()->for($this->user)->withType(AccountTypeEnum::LOAN)->create(['name' => 'Loan B', 'user_group_id' => $this->user->user_group_id]);
     }
 }

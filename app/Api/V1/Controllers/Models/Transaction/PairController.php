@@ -33,8 +33,10 @@ use FireflyIII\Services\Internal\Pair\PairMergeService;
 use FireflyIII\Support\JsonApi\Enrichments\TransactionGroupEnrichment;
 use FireflyIII\Transformers\TransactionGroupTransformer;
 use FireflyIII\User;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 use League\Fractal\Resource\Item;
 use Override;
 
@@ -58,11 +60,17 @@ final class PairController extends Controller
             $result = app(PairMergeService::class)->unmerge($userGroup->id, (int) $pairMerge, $request->boolean('force'));
         } catch (PairRefusedException $e) {
             return $this->refused($e);
+        } catch (QueryException $e) {
+            return $this->busy($e);
         }
         /** @var PairMerge $merge */
         $merge     = $result['merge'];
         $body      = $this->body($merge, $userGroup->id);
         $body['unmerged_at'] = $merge->unmerged_at?->toAtomString();
+        if ([] !== $result['overridden']) {
+            // force=true discarded these later edits of keep; the client can show or log what was overwritten
+            $body['overridden'] = $result['overridden'];
+        }
 
         return response()->json(['data' => $body])->header('Content-Type', self::JSON_CONTENT_TYPE);
     }
@@ -73,13 +81,23 @@ final class PairController extends Controller
     public function store(Request $request): JsonResponse
     {
         $userGroup = $this->validateUserGroup($request);
-        $data      = $request->validate([
-            'keep_group_id'     => ['required', 'integer', 'min:1'],
-            'absorb_group_id'   => ['required', 'integer', 'min:1', 'different:keep_group_id'],
-            'keep_updated_at'   => ['required', 'string', 'date'],
-            'absorb_updated_at' => ['required', 'string', 'date'],
-            'evidence'          => ['nullable', 'array'],
-        ]);
+        try {
+            $data = $request->validate([
+                'keep_group_id'     => ['required', 'integer', 'min:1'],
+                'absorb_group_id'   => ['required', 'integer', 'min:1', 'different:keep_group_id'],
+                'keep_updated_at'   => ['required', 'string', 'date_format:Y-m-d\TH:i:sP,Y-m-d\TH:i:sp'],
+                'absorb_updated_at' => ['required', 'string', 'date_format:Y-m-d\TH:i:sP,Y-m-d\TH:i:sp'],
+                'evidence'          => ['nullable', 'array', static function (string $attribute, mixed $value, \Closure $fail): void {
+                    $json = json_encode($value);
+                    if (false === $json || strlen($json) > 65536) {
+                        $fail('evidence must be valid JSON (UTF-8) and at most 64 KiB.');
+                    }
+                }],
+            ]);
+        } catch (ValidationException $e) {
+            // same envelope as a domain refusal: clients branch on "reason" only
+            return response()->json(['message' => $e->getMessage(), 'reason' => 'invalid_request', 'errors' => $e->errors()], 422)->header('Content-Type', self::JSON_CONTENT_TYPE);
+        }
 
         try {
             $result = app(PairMergeService::class)->merge(
@@ -92,9 +110,12 @@ final class PairController extends Controller
             );
         } catch (PairRefusedException $e) {
             return $this->refused($e);
+        } catch (QueryException $e) {
+            return $this->busy($e);
         }
 
-        return response()->json(['data' => $this->body($result['merge'], $userGroup->id)])->header('Content-Type', self::JSON_CONTENT_TYPE);
+        // "replayed": the pair already had a live merge, nothing was written by this call
+        return response()->json(['data' => $this->body($result['merge'], $userGroup->id) + ['replayed' => !$result['created']]])->header('Content-Type', self::JSON_CONTENT_TYPE);
     }
 
     /** @return array<string, mixed> */
@@ -139,6 +160,17 @@ final class PairController extends Controller
         $transformer->setParameters($this->parameters);
 
         return $this->getManager()->createData(new Item($selected, $transformer, 'transactions'))->toArray();
+    }
+
+    /** A deadlock, lock timeout or serialization failure: nothing was written, retry. Anything else is a real error. */
+    private function busy(QueryException $e): JsonResponse
+    {
+        $state = (string) ($e->errorInfo[0] ?? $e->getCode());
+        if (!in_array($state, ['40P01', '55P03', '40001'], true)) {
+            throw $e;
+        }
+
+        return response()->json(['message' => 'Pair busy: try again', 'reason' => 'busy', 'retry' => true], 503)->header('Retry-After', '1')->header('Content-Type', self::JSON_CONTENT_TYPE);
     }
 
     private function refused(PairRefusedException $e): JsonResponse

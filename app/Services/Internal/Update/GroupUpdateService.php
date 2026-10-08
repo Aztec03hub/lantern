@@ -34,6 +34,7 @@ use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Services\Internal\Destroy\JournalDestroyService;
 use FireflyIII\Services\Internal\Pair\PairMergeService;
 use FireflyIII\Support\Facades\Preferences;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -48,6 +49,25 @@ class GroupUpdateService
      * @throws FireflyException
      */
     public function update(TransactionGroup $transactionGroup, array $data): TransactionGroup
+    {
+        // Every edit moves ONE version stamp, written to the group and all its journals AFTER the last write of the edit
+        // (the update code touches the group with "now" at the end, which must not win). The API shows the group's
+        // stamp, and a pair merge compares it (PairMergeService::bumpGroupVersion). Same transaction as the edit, so no
+        // committed state has the new data with the old stamp.
+        return DB::transaction(function () use ($transactionGroup, $data): TransactionGroup {
+            $previous = PairMergeService::groupVersion((int) $transactionGroup->id);
+            $result   = $this->applyUpdate($transactionGroup, $data);
+            PairMergeService::bumpGroupVersion((int) $transactionGroup->id, $previous);
+
+            return $result->refresh();
+        });
+    }
+
+    /**
+     * @throws DuplicateTransactionException
+     * @throws FireflyException
+     */
+    private function applyUpdate(TransactionGroup $transactionGroup, array $data): TransactionGroup
     {
         Log::debug(sprintf('Now in %s', __METHOD__));
         Log::debug('Now in group update service', $data);
@@ -164,11 +184,7 @@ class GroupUpdateService
         $updateService->setTransactionGroup($transactionGroup);
         $updateService->setTransactionJournal($journal);
         $updateService->setData($data);
-        $previous = $journal->updated_at;
         $updateService->update();
-        // every edit moves the journal's version stamp, also edits that only touch tags, notes or the category
-        // (a pair merge compares this stamp, see PairMergeService::nextVersion).
-        PairMergeService::bumpJournalVersion((int) $journal->id, $previous);
     }
 
     /**

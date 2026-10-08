@@ -80,11 +80,76 @@ class PairMergeService
         return $floor->greaterThan($now) ? $floor : $now;
     }
 
-    /** Bump the version of a journal (and its group) with the keyed query builder. */
+    /**
+     * The stamps of a journal and of its group.
+     *
+     * @return null|array{journal: ?Carbon, group: ?Carbon}
+     */
+    public static function stampsOf(int $journalId): ?array
+    {
+        $row = DB::table('transaction_journals')
+            ->join('transaction_groups', 'transaction_groups.id', '=', 'transaction_journals.transaction_group_id')
+            ->where('transaction_journals.id', $journalId)
+            ->first(['transaction_journals.updated_at as journal_at', 'transaction_groups.updated_at as group_at'])
+        ;
+        if (null === $row) {
+            return null;
+        }
+
+        return ['journal' => null === $row->journal_at ? null : Carbon::parse($row->journal_at), 'group' => null === $row->group_at ? null : Carbon::parse($row->group_at)];
+    }
+
+    /** The version of a journal: the later of its own and its group's updated_at (null when the journal is unknown). */
+    public static function versionOf(int $journalId): ?Carbon
+    {
+        $stamps = self::stampsOf($journalId);
+        if (null === $stamps || null === $stamps['journal'] || null === $stamps['group']) {
+            return $stamps['journal'] ?? $stamps['group'] ?? null;
+        }
+
+        return $stamps['group']->greaterThan($stamps['journal']) ? $stamps['group'] : $stamps['journal'];
+    }
+
+    /** The version of a group: the latest updated_at of the group and of its journals. */
+    public static function groupVersion(int $groupId): ?Carbon
+    {
+        $stamps = DB::table('transaction_journals')->where('transaction_group_id', $groupId)->pluck('updated_at')->all();
+        $stamps[] = DB::table('transaction_groups')->where('id', $groupId)->value('updated_at');
+        $latest = null;
+        foreach ($stamps as $stamp) {
+            $at = null === $stamp ? null : Carbon::parse($stamp);
+            if (null !== $at && (null === $latest || $at->greaterThan($latest))) {
+                $latest = $at;
+            }
+        }
+
+        return $latest;
+    }
+
+    /** Move a group and all its journals to one new stamp, at least one second past $previous. */
+    public static function bumpGroupVersion(int $groupId, null|CarbonInterface|string $previous): Carbon
+    {
+        $next  = self::nextVersion($previous);
+        $stamp = $next->toDateTimeString();
+        DB::table('transaction_journals')->where('transaction_group_id', $groupId)->update(['updated_at' => $stamp]);
+        DB::table('transaction_groups')->where('id', $groupId)->update(['updated_at' => $stamp]);
+
+        return $next;
+    }
+
+    /**
+     * Bump the version of a journal AND its group to the same stamp, with the keyed query builder. The API shows the
+     * group's stamp, so after every bump the stamp a client reads is the one the stale check compares.
+     */
     public static function bumpJournalVersion(int $journalId, null|CarbonInterface|string $previous): Carbon
     {
-        $next = self::nextVersion($previous);
-        DB::table('transaction_journals')->where('id', $journalId)->update(['updated_at' => $next->toDateTimeString()]);
+        $next    = self::nextVersion($previous);
+        $stamp   = $next->toDateTimeString();
+        $groupId = DB::table('transaction_journals')->where('id', $journalId)->value('transaction_group_id');
+        DB::table('transaction_journals')->where('id', $journalId)->update(['updated_at' => $stamp]);
+        if (null !== $groupId) {
+            DB::table('transaction_groups')->where('id', $groupId)->update(['updated_at' => $stamp]);
+        }
 
         return $next;
     }
@@ -98,6 +163,9 @@ class PairMergeService
      */
     public function merge(int $userGroupId, int $keepGroupId, int $absorbGroupId, string $keepUpdatedAt, string $absorbUpdatedAt, ?array $evidence): array
     {
+        if ($keepGroupId === $absorbGroupId) {
+            throw new PairRefusedException(422, 'same_group');
+        }
         $destroyObjects = null;
         $updateObjects  = null;
         $result         = DB::transaction(function () use ($userGroupId, $keepGroupId, $absorbGroupId, $keepUpdatedAt, $absorbUpdatedAt, $evidence, &$destroyObjects, &$updateObjects): array {
@@ -123,8 +191,8 @@ class PairMergeService
             $absLink     = $this->singleLink($userGroupId, $absJ);
             $this->refuseIfStateWouldBeLost($keepJ);
             $this->refuseIfStateWouldBeLost($absJ);
-            $this->refuseIfStale($keepJ, $keepUpdatedAt);
-            $this->refuseIfStale($absJ, $absorbUpdatedAt);
+            $this->refuseIfStale($keepJ, $keepUpdatedAt, 'keep');
+            $this->refuseIfStale($absJ, $absorbUpdatedAt, 'absorb');
             $typeName    = $this->validateDomain($keepJ, $absJ);
 
             // the DELETED event describes the absorbed group as it was; the UPDATED event also needs keep's old accounts.
@@ -135,9 +203,12 @@ class PairMergeService
             $absorbedRow = (array) DB::table('transaction_journals')->where('id', $absJ)->first();
             $snapshot    = $this->snapshot($userGroupId, $absorbGroup, $absJ);
 
+            $keepRows    = $this->rowsOf($keepJ);
+            $absRows     = $this->rowsOf($absJ);
             $this->applyToKeep($userGroupId, $keepJ, $absJ, $typeName, $keepLink, $absLink, $absorbedRow);
-            $version     = self::bumpJournalVersion($keepJ, $keepBefore['updated_at']);
-            DB::table('transaction_groups')->where('id', $keepGroupId)->update(['updated_at' => $version->toDateTimeString()]);
+            $keepDate    = (string) DB::table('transaction_journals')->where('id', $keepJ)->value('date');
+            $this->flagLaterRows(array_merge(array_column($keepRows['rows'], 'account_id'), array_column($absRows['rows'], 'account_id')), min($keepDate, (string) $absorbedRow['date']));
+            $version     = self::bumpJournalVersion($keepJ, self::versionOf($keepJ));
             $keepAfter   = $this->keepState($userGroupId, $keepJ);
 
             $journal     = TransactionJournal::findOrFail($absJ);
@@ -173,7 +244,7 @@ class PairMergeService
     /**
      * Undo a merge. Returns the merge row (already unmerged when the call was a repeat).
      *
-     * @return array{merge: PairMerge, changed: bool}
+     * @return array{merge: PairMerge, changed: bool, overridden: array<int, array{field: string, expected: mixed, current: mixed}>}
      *
      * @throws PairRefusedException
      */
@@ -192,9 +263,12 @@ class PairMergeService
                 array_column($pre->keep_before['plaid_links'] ?? [], 'plaid_transaction_id'),
             );
             $this->lock($userGroupId, $journalIds, $plaidIds);
-            $merge      = PairMerge::where('id', $pairMergeId)->lockForUpdate()->firstOrFail();
+            $merge      = PairMerge::where('id', $pairMergeId)->lockForUpdate()->first();
+            if (null === $merge) {
+                throw new PairRefusedException(404, 'not_found');
+            }
             if (null !== $merge->unmerged_at) {
-                return ['merge' => $merge, 'changed' => false];
+                return ['merge' => $merge, 'changed' => false, 'overridden' => []];
             }
             $keepJournal = TransactionJournal::where('id', $merge->keep_journal_id)->first();
             if (null === $keepJournal) {
@@ -202,6 +276,7 @@ class PairMergeService
             }
             $keepJ       = (int) $merge->keep_journal_id;
             $this->refuseIfLinksTaken($userGroupId, $merge);
+            $this->refuseIfAccountsMissing($userGroupId, $merge);
             $current     = $this->keepState($userGroupId, $keepJ);
             $diverged    = $this->diverged($merge->keep_after, $current);
             if ([] !== $diverged && !$force) {
@@ -211,11 +286,16 @@ class PairMergeService
 
             $this->restoreAbsorbed($userGroupId, $merge);
             $this->restoreKeep($userGroupId, $merge, $current);
-            self::bumpJournalVersion($keepJ, $current['updated_at']);
+            $keepDate = (string) DB::table('transaction_journals')->where('id', $keepJ)->value('date');
+            $this->flagLaterRows(
+                array_merge(array_column($merge->absorbed_snapshot['tables']['transactions'] ?? [], 'account_id'), array_column($this->rowsOf($keepJ)['rows'], 'account_id'), [$merge->keep_before['destination_account_id'] ?? 0]),
+                min($keepDate, (string) ($merge->absorbed_snapshot['journal']['date'] ?? $keepDate)),
+            );
+            self::bumpJournalVersion($keepJ, self::versionOf($keepJ));
             $merge->unmerged_at = Carbon::now();
             $merge->save();
 
-            return ['merge' => $merge, 'changed' => true];
+            return ['merge' => $merge, 'changed' => true, 'overridden' => $diverged];
         });
         if ($result['changed'] && null !== $updateObjects) {
             $merge = $result['merge'];
@@ -355,16 +435,16 @@ class PairMergeService
     }
 
     /** @throws PairRefusedException */
-    private function refuseIfStale(int $journalId, string $sent): void
+    private function refuseIfStale(int $journalId, string $sent, string $side): void
     {
-        // The version is the later of the journal's and its group's updated_at: some PUTs bump only the group, and a PUT
-        // can leave the group a second ahead of its journal. The API shows the group's stamp, which is that later one.
-        $row = DB::table('transaction_journals')
-            ->join('transaction_groups', 'transaction_groups.id', '=', 'transaction_journals.transaction_group_id')
-            ->where('transaction_journals.id', $journalId)
-            ->first(['transaction_journals.updated_at as journal_at', 'transaction_groups.updated_at as group_at']);
-        if (null === $row || Carbon::parse($sent)->getTimestamp() !== max(Carbon::parse($row->journal_at)->getTimestamp(), Carbon::parse($row->group_at)->getTimestamp())) {
-            throw new PairRefusedException(409, 'stale');
+        // Every bump writes the same stamp to the journal and its group. They can still differ (a journal saved a second
+        // after its group at creation, rows written by older code). The client reads the GROUP's stamp from the API, so
+        // that one is accepted; so is the later of the two, which the refusal below hands back as current_updated_at.
+        $stamps  = self::stampsOf($journalId);
+        $current = self::versionOf($journalId);
+        $sentAt  = Carbon::parse($sent)->getTimestamp();
+        if (null === $stamps || null === $current || ($sentAt !== $current->getTimestamp() && $sentAt !== $stamps['group']?->getTimestamp())) {
+            throw new PairRefusedException(409, 'stale', ['side' => $side, 'current_updated_at' => $current?->toAtomString()]);
         }
     }
 
@@ -385,7 +465,7 @@ class PairMergeService
         }
         $keepSource = $keep['source'];
         $absDest    = $abs['destination'];
-        if (null === $keepSource || null === $absDest) {
+        if (null === $keepSource || null === $absDest || null === $keep['destination'] || null === $abs['source']) {
             throw new PairRefusedException(422, 'direction');
         }
         if (!in_array($keepSource->account_type, self::OWN_TYPES, true) || !in_array($absDest->account_type, self::OWN_TYPES, true)) {
@@ -644,6 +724,10 @@ class PairMergeService
         $snapshot = $merge->absorbed_snapshot;
         $this->upsert('transaction_groups', $snapshot['group']);
         $this->upsert('transaction_journals', $snapshot['journal']);
+        // one stamp for journal and group, also for snapshots taken before every bump wrote both
+        $later = max((string) $snapshot['journal']['updated_at'], (string) $snapshot['group']['updated_at']);
+        DB::table('transaction_journals')->where('id', $snapshot['journal']['id'])->update(['updated_at' => $later]);
+        DB::table('transaction_groups')->where('id', $snapshot['group']['id'])->update(['updated_at' => $later]);
         foreach (self::JOURNAL_TABLES as $table => $unused) {
             foreach ($snapshot['tables'][$table] ?? [] as $row) {
                 $this->upsert($table, $row);
@@ -682,6 +766,58 @@ class PairMergeService
             if (!in_array($link->transaction_journal_id, $mine, true)) {
                 throw new PairRefusedException(409, 'link_conflict', ['conflicts' => [app(PlaidLinkService::class)->describe($link)]]);
             }
+        }
+    }
+
+    /**
+     * Every account the restore would write a transaction onto must still be live (not soft deleted, same user group):
+     * the payee naming pass merges and deletes counter accounts. Refused before anything is changed, force or not.
+     *
+     * @throws PairRefusedException
+     */
+    private function refuseIfAccountsMissing(int $userGroupId, PairMerge $merge): void
+    {
+        $ids = array_map('intval', array_column($merge->absorbed_snapshot['tables']['transactions'] ?? [], 'account_id'));
+        if (null !== ($merge->keep_before['destination_account_id'] ?? null)) {
+            $ids[] = (int) $merge->keep_before['destination_account_id'];
+        }
+        $ids = array_values(array_unique($ids));
+        if ([] === $ids) {
+            return;
+        }
+        $live    = DB::table('accounts')->where('user_group_id', $userGroupId)->whereNull('deleted_at')->whereIn('id', $ids)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+        $missing = array_values(array_diff($ids, $live));
+        sort($missing);
+        if ([] !== $missing) {
+            throw new PairRefusedException(409, 'account_missing', ['accounts' => $missing]);
+        }
+    }
+
+    /**
+     * Flag the live rows of the given accounts dated on or after $from, so the nightly recalculation repairs their
+     * running balances even if the post-commit listeners never run.
+     *
+     * @param array<int, int|string> $accountIds
+     */
+    private function flagLaterRows(array $accountIds, string $from): void
+    {
+        $accountIds = array_values(array_unique(array_map('intval', $accountIds)));
+        if ([] === $accountIds) {
+            return;
+        }
+        // SKIP LOCKED: these rows belong to other journals, so a concurrent merge on the same account may hold some of
+        // them; waiting for it while it waits for ours would be a deadlock. A skipped row is being rewritten by that
+        // merge's own recalculation.
+        $ids = DB::table('transactions')
+            ->whereNull('deleted_at')
+            ->whereIn('account_id', $accountIds)
+            ->whereIn('transaction_journal_id', static fn ($q) => $q->select('id')->from('transaction_journals')->whereNull('deleted_at')->where('date', '>=', $from))
+            ->orderBy('id')
+            ->lock('for update skip locked')
+            ->pluck('id')
+        ;
+        if ($ids->isNotEmpty()) {
+            DB::table('transactions')->whereIn('id', $ids->all())->update(['balance_dirty' => true]);
         }
     }
 
