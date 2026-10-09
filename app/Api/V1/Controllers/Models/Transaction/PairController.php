@@ -49,6 +49,16 @@ final class PairController extends Controller
     /** ISO 8601 with a T and an offset; seconds and a fraction are optional (java.time drops zero seconds). The instant is compared, not the text. */
     private const string STAMP_PATTERN = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/D';
 
+    /** The regex checks digits only; this refuses what Carbon cannot parse (month 13, minute 60, +99:99), which would be a 500. */
+    private static function parsesAsDate(string $attribute, mixed $value, \Closure $fail): void
+    {
+        try {
+            \Carbon\Carbon::parse((string) $value);
+        } catch (\Throwable) {
+            $fail('The '.$attribute.' is not a valid date and time.');
+        }
+    }
+
     #[Override]
     protected array $acceptedRoles = [UserRoleEnum::MANAGE_TRANSACTIONS];
 
@@ -88,8 +98,8 @@ final class PairController extends Controller
             $data = $request->validate([
                 'keep_group_id'     => ['required', 'integer', 'min:1'],
                 'absorb_group_id'   => ['required', 'integer', 'min:1', 'different:keep_group_id'],
-                'keep_updated_at'   => ['required', 'string', 'regex:'.self::STAMP_PATTERN],
-                'absorb_updated_at' => ['required', 'string', 'regex:'.self::STAMP_PATTERN],
+                'keep_updated_at'   => ['required', 'string', 'regex:'.self::STAMP_PATTERN, self::parsesAsDate(...)],
+                'absorb_updated_at' => ['required', 'string', 'regex:'.self::STAMP_PATTERN, self::parsesAsDate(...)],
                 'evidence'          => ['nullable', 'array', static function (string $attribute, mixed $value, \Closure $fail): void {
                     $json = json_encode($value);
                     if (false === $json || strlen($json) > 65536) {

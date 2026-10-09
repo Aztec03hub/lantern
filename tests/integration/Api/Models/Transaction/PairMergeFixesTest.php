@@ -233,6 +233,29 @@ final class PairMergeFixesTest extends PairTestCase
         $this->merge($keep, $abs)->assertOk()->assertJsonPath('data.replayed', true);
     }
 
+    /** core-2 L3 (r3): the unmerge's own afterCommit call is covered too: a listener database error after the commit is not "busy". */
+    public function testPostCommitDatabaseErrorOnUnmergeIsNotBusy(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $this->withoutExceptionHandling();
+        Event::listen(UpdatedSingleTransactionGroup::class, static function (): void {
+            $e = new \PDOException('deadlock detected');
+            $e->errorInfo = ['40P01', 7, 'deadlock detected'];
+
+            throw new QueryException('pgsql', 'select 1', [], $e);
+        });
+        try {
+            $this->unmerge($id);
+            $this->fail('the listener failure must surface');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('committed', $e->getMessage());
+        }
+        $this->assertSame(0, $this->liveMerges());
+        $this->app->make('events')->forget(UpdatedSingleTransactionGroup::class);
+        $this->unmerge($id)->assertOk();
+    }
+
     // ---------------------------------------------------------------- unmerge: accounts, fields, balances
 
     /** core-2 L5 (r2): restoreAbsorbed writes ONE stamp even when the snapshot's journal stamp is behind its group. */
@@ -441,6 +464,21 @@ final class PairMergeFixesTest extends PairTestCase
             $res = $this->merge($keep, $abs, ['absorb_updated_at' => $bad])->assertStatus(422);
             $this->assertArrayHasKey('absorb_updated_at', $res->json('errors'), $bad);
         }
+    }
+
+    /** core-2 L1 (r3): digits-only stamps that are not real dates are a 422, not a 500 from Carbon::parse. */
+    public function testCalendarImpossibleStampsAreRefused(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $before       = $this->dump();
+        foreach (['2026-13-45T25:61:00Z', '2026-10-08T12:60:00Z', '2026-10-08T12:00:00+99:99'] as $bad) {
+            foreach (['keep_updated_at', 'absorb_updated_at'] as $field) {
+                $res = $this->merge($keep, $abs, [$field => $bad])->assertStatus(422);
+                $this->assertSame('invalid_request', $res->json('reason'), $bad);
+                $this->assertArrayHasKey($field, $res->json('errors'), $bad);
+            }
+        }
+        $this->assertDumpsEqual($before, $this->dump());
     }
 
     /** core-2 H1 (r2): the shapes java.time and Jackson send (zero seconds dropped, always Z, fractions) merge; the instant is what counts. */

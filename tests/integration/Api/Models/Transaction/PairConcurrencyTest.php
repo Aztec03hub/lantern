@@ -212,6 +212,37 @@ final class PairConcurrencyTest extends PairTestCase
         $this->assertSame(1, $this->liveMerges());
     }
 
+    /** core-2 L2 (r3), kills the no-transactions-lock mutant: a UI reconcile (transactions row only, no journal lock) holds its row; a merge must queue on it and then be refused as reconciled. */
+    public function testMergeQueuedBehindAReconcileOfKeepIsRefusedAsReconciled(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $held         = $this->flag();
+        $out          = $this->parallel([
+            fn (): array => $this->reconcileHolding($keep, $held, 600),
+            fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
+        ], ['transactionid', 'tuple']);
+        $this->assertSame(409, $out[1]['status'], json_encode($out));
+        $this->assertSame('reconciled', $out[1]['reason'], json_encode($out));
+        $this->assertSame(0, PairMerge::count());
+    }
+
+    /** core-2 N1 (r3): a REAL race for the PUT lock (r2 L1): PUT 2 queues behind PUT 1 and must bump from PUT 1's stamp, so the final stamp is two steps past the start. */
+    public function testTwoQueuedPutsMoveTheStampTwoSteps(): void
+    {
+        [$keep] = $this->pair($this->assetA, $this->assetB);
+        $start  = \Carbon\Carbon::now()->addSeconds(100)->startOfSecond();
+        DB::table('transaction_groups')->where('id', $keep['group'])->update(['updated_at' => $start->toDateTimeString()]);
+        DB::table('transaction_journals')->where('transaction_group_id', $keep['group'])->update(['updated_at' => $start->toDateTimeString()]);
+        $held = $this->flag();
+        $out  = $this->parallel([
+            fn (): array => $this->putHolding($keep, 'first', $held, 600),
+            fn (): array => $this->after($held, fn (): array => $this->doPut($this->user, $keep, 'second')),
+        ]);
+        $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
+        $this->assertSame('second', TransactionJournal::find($keep['journal'])->description);
+        $this->assertSame($start->copy()->addSeconds(2)->toDateTimeString(), (string) DB::table('transaction_groups')->where('id', $keep['group'])->value('updated_at'));
+    }
+
     /** Merges of unrelated pairs share no lock and both succeed. */
     public function testUnrelatedMergesRunInParallel(): void
     {
@@ -366,6 +397,8 @@ final class PairConcurrencyTest extends PairTestCase
 
     /**
      * Run every job in its own forked process with its own connection. Returns the jobs' results in order.
+     * The queue check proves that SOME backend waited on a lock of that kind, not which one: unambiguous with two children. With a third
+     * connection (a poller, a listener), name each child's application_name and filter on it.
      *
      * @param array<int, callable():array<string,mixed>> $jobs
      * @param array<int, string>                         $expectQueue pg_stat_activity wait_event names (Lock type), at least one of which the parent must SEE
@@ -509,6 +542,17 @@ final class PairConcurrencyTest extends PairTestCase
             touch($flag);
             usleep($sleepMs * 1000);
         });
+    }
+
+    private function reconcileHolding(array $keep, string $flag, int $sleepMs): array
+    {
+        DB::transaction(static function () use ($keep, $flag, $sleepMs): void {
+            DB::table('transactions')->where('transaction_journal_id', $keep['journal'])->update(['reconciled' => true]);
+            touch($flag);
+            usleep($sleepMs * 1000);
+        });
+
+        return ['status' => 200, 'id' => null, 'reason' => null];
     }
 
     /** @return array<string, mixed> */
