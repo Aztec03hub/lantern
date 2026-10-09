@@ -18,7 +18,7 @@ if [ $# -eq 0 ]; then
   declare -A FILTER=([PairMerge]='PairMergeTest' [PairState]='PairMergeStateTest' [PairFixes]='PairMergeFixesTest' [PairConcurrency]='PairConcurrency' [PlaidLink]='PlaidLink|PlaidAccountDelete')
   # the keys are written once here, so three parallel stacks do not race on the shared storage/ directory
   mkdir -p storage
-  [ -f storage/oauth-private.key ] || docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/var/www/html -w /var/www/html --entrypoint php "${FIREFLY_IMAGE:-fireflyiii/core:version-6.7.7}" artisan passport:keys -q >/dev/null
+  [ -f storage/oauth-private.key ] || docker run --rm --user "$(id -u):$(id -g)" -e APP_KEY=SomeRandomStringOf32CharsExactly -v "$PWD":/var/www/html -w /var/www/html --entrypoint php "${FIREFLY_IMAGE:-fireflyiii/core:version-6.7.7}" artisan passport:keys -q >/dev/null
   T0=$(date +%s.%N)
   declare -A PID
   for g in "${GROUPS_[@]}"; do
