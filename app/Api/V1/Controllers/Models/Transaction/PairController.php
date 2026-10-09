@@ -49,6 +49,9 @@ final class PairController extends Controller
     /** ISO 8601 with a T and an offset; seconds and a fraction are optional (java.time drops zero seconds). The instant is compared, not the text. */
     private const string STAMP_PATTERN = '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/D';
 
+    #[Override]
+    protected array $acceptedRoles = [UserRoleEnum::MANAGE_TRANSACTIONS];
+
     /** The regex checks digits only; this refuses what Carbon cannot parse (month 13, minute 60, +99:99), which would be a 500. */
     private static function parsesAsDate(string $attribute, mixed $value, \Closure $fail): void
     {
@@ -58,9 +61,6 @@ final class PairController extends Controller
             $fail('The '.$attribute.' is not a valid date and time.');
         }
     }
-
-    #[Override]
-    protected array $acceptedRoles = [UserRoleEnum::MANAGE_TRANSACTIONS];
 
     /**
      * DELETE /api/v1/plaid-links/pair/{pairMerge}?force=true

@@ -221,12 +221,14 @@ final class PairMergeFixesTest extends PairTestCase
 
             throw new QueryException('pgsql', 'select 1', [], $e);
         });
+        $thrown = false;
         try {
             $this->merge($keep, $abs);
-            $this->fail('the listener failure must surface');
         } catch (\RuntimeException $e) {
+            $thrown = true;
             $this->assertStringContainsString('committed', $e->getMessage());
         }
+        $this->assertTrue($thrown, 'the post-commit listener failure must surface as an exception');
         $this->assertSame(1, $this->liveMerges());
         // a retry is idempotent
         $this->app->make('events')->forget(UpdatedSingleTransactionGroup::class);
@@ -245,12 +247,14 @@ final class PairMergeFixesTest extends PairTestCase
 
             throw new QueryException('pgsql', 'select 1', [], $e);
         });
+        $thrown = false;
         try {
             $this->unmerge($id);
-            $this->fail('the listener failure must surface');
         } catch (\RuntimeException $e) {
+            $thrown = true;
             $this->assertStringContainsString('committed', $e->getMessage());
         }
+        $this->assertTrue($thrown, 'the post-commit listener failure must surface as an exception');
         $this->assertSame(0, $this->liveMerges());
         $this->app->make('events')->forget(UpdatedSingleTransactionGroup::class);
         $this->unmerge($id)->assertOk();
