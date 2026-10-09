@@ -232,10 +232,12 @@ class PairMergeService
             return ['merge' => $merge, 'created' => true];
         });
         if ($result['created'] && null !== $destroyObjects && null !== $updateObjects) {
-            $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($keepGroupId));
-            $this->fireUpdated($updateObjects);
-            event(new DestroyedSingleTransactionGroup(new TransactionGroupEventFlags(), $destroyObjects));
-            event(new WebhookMessagesRequestSending());
+            $this->afterCommit(function () use ($updateObjects, $destroyObjects, $keepGroupId): void {
+                $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($keepGroupId));
+                $this->fireUpdated($updateObjects);
+                event(new DestroyedSingleTransactionGroup(new TransactionGroupEventFlags(), $destroyObjects));
+                event(new WebhookMessagesRequestSending());
+            });
         }
 
         return $result;
@@ -299,12 +301,28 @@ class PairMergeService
         });
         if ($result['changed'] && null !== $updateObjects) {
             $merge = $result['merge'];
-            $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($merge->keep_group_id));
-            $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($merge->absorbed_group_id));
-            $this->fireUpdated($updateObjects);
+            $this->afterCommit(function () use ($updateObjects, $merge): void {
+                $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($merge->keep_group_id));
+                $updateObjects->appendFromTransactionGroup(TransactionGroup::findOrFail($merge->absorbed_group_id));
+                $this->fireUpdated($updateObjects);
+            });
         }
 
         return $result;
+    }
+
+    /**
+     * Run work that follows the commit. A database error here must NOT look like a retryable "busy, nothing written"
+     * (the controller maps QueryException to 503): the merge or unmerge is committed, so it surfaces as a plain failure
+     * and a retry stays idempotent (merge replays, unmerge answers "already unmerged").
+     */
+    private function afterCommit(\Closure $work): void
+    {
+        try {
+            $work();
+        } catch (\Illuminate\Database\QueryException $e) {
+            throw new \RuntimeException('The change is committed, but the follow-up work failed (SQLSTATE '.($e->errorInfo[0] ?? '?').').', 0, $e);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -785,7 +803,8 @@ class PairMergeService
         if ([] === $ids) {
             return;
         }
-        $live    = DB::table('accounts')->where('user_group_id', $userGroupId)->whereNull('deleted_at')->whereIn('id', $ids)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+        // a NULL user_group_id (very old accounts) is accepted: the snapshot already names these accounts
+        $live    = DB::table('accounts')->where(static fn ($q) => $q->where('user_group_id', $userGroupId)->orWhereNull('user_group_id'))->whereNull('deleted_at')->whereIn('id', $ids)->pluck('id')->map(static fn ($id): int => (int) $id)->all();
         $missing = array_values(array_diff($ids, $live));
         sort($missing);
         if ([] !== $missing) {

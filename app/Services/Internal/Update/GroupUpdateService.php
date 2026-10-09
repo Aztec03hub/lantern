@@ -55,6 +55,8 @@ class GroupUpdateService
         // stamp, and a pair merge compares it (PairMergeService::bumpGroupVersion). Same transaction as the edit, so no
         // committed state has the new data with the old stamp.
         return DB::transaction(function () use ($transactionGroup, $data): TransactionGroup {
+            // row locks first (the order a pair merge takes them), so the stamp read below is the committed one
+            DB::table('transaction_journals')->where('transaction_group_id', $transactionGroup->id)->orderBy('id')->lockForUpdate()->get(['id']);
             $previous = PairMergeService::groupVersion((int) $transactionGroup->id);
             $result   = $this->applyUpdate($transactionGroup, $data);
             PairMergeService::bumpGroupVersion((int) $transactionGroup->id, $previous);

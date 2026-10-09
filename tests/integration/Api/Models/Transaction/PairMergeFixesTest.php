@@ -164,7 +164,92 @@ final class PairMergeFixesTest extends PairTestCase
         }
     }
 
+    /** core-2 L4 (r2): the group's stamp is accepted while the journal is two seconds ahead; the journal's stamp too; group + 1 s is stale. */
+    public function testGroupStampArmOfTheStaleCheckWithAJournalAhead(): void
+    {
+        foreach (['group', 'journal', 'plus-one'] as $n => $case) {
+            [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT-'.$n, 'IN-'.$n);
+            $group        = Carbon::parse('2026-10-08 12:00:00');
+            DB::table('transaction_groups')->where('id', $keep['group'])->update(['updated_at' => $group->toDateTimeString()]);
+            DB::table('transaction_journals')->where('id', $keep['journal'])->update(['updated_at' => $group->copy()->addSeconds(2)->toDateTimeString()]);
+            $sent = match ($case) {
+                'group'    => $group->toAtomString(),
+                'journal'  => $group->copy()->addSeconds(2)->toAtomString(),
+                'plus-one' => $group->copy()->addSecond()->toAtomString(),
+            };
+            $res = $this->merge($keep, $abs, ['keep_updated_at' => $sent]);
+            'plus-one' === $case ? $res->assertStatus(409)->assertJsonPath('reason', 'stale') : $res->assertOk();
+        }
+    }
+
+    /** core-2 L1 (r2): a PUT takes the journal row locks BEFORE it reads the previous stamp. */
+    public function testPutLocksTheJournalsBeforeReadingTheStamp(): void
+    {
+        [$keep] = $this->pair($this->assetA, $this->assetB);
+        $log    = [];
+        DB::listen(static function ($query) use (&$log): void {
+            if (str_contains($query->sql, 'transaction_journals')) {
+                $log[] = str_contains($query->sql, 'for update') ? 'lock' : (str_starts_with($query->sql, 'select "updated_at"') ? 'stamp' : 'other');
+            }
+        });
+        $this->editGroup($keep['group'], ['description' => 'edited']);
+        $this->assertContains('lock', $log);
+        $this->assertContains('stamp', $log, implode(',', $log));
+        $this->assertLessThan(array_search('stamp', $log, true), array_search('lock', $log, true), implode(',', $log));
+    }
+
+    /** core-2 L2 (r2): an account with a NULL user_group_id does not make the unmerge a permanent 409. */
+    public function testUnmergeWithAnAccountWithoutAUserGroupWorks(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $accounts     = array_column(PairMerge::findOrFail($id)->absorbed_snapshot['tables']['transactions'], 'account_id');
+        $this->assertNotSame([], $accounts);
+        DB::table('accounts')->whereIn('id', $accounts)->update(['user_group_id' => null]);
+        $this->unmerge($id)->assertOk();
+        $this->assertSame(0, $this->liveMerges());
+    }
+
+    /** core-2 L3 (r2): a database error in a post-commit listener is not "busy, nothing written": the merge is committed. */
+    public function testPostCommitDatabaseErrorIsNotBusy(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $this->withoutExceptionHandling();
+        Event::listen(UpdatedSingleTransactionGroup::class, static function (): void {
+            $e = new \PDOException('deadlock detected');
+            $e->errorInfo = ['40P01', 7, 'deadlock detected'];
+
+            throw new QueryException('pgsql', 'select 1', [], $e);
+        });
+        try {
+            $this->merge($keep, $abs);
+            $this->fail('the listener failure must surface');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('committed', $e->getMessage());
+        }
+        $this->assertSame(1, $this->liveMerges());
+        // a retry is idempotent
+        $this->app->make('events')->forget(UpdatedSingleTransactionGroup::class);
+        $this->merge($keep, $abs)->assertOk()->assertJsonPath('data.replayed', true);
+    }
+
     // ---------------------------------------------------------------- unmerge: accounts, fields, balances
+
+    /** core-2 L5 (r2): restoreAbsorbed writes ONE stamp even when the snapshot's journal stamp is behind its group. */
+    public function testRestoreAbsorbedUnifiesAnOldSnapshotsStamps(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $merge        = PairMerge::findOrFail($id);
+        $snapshot     = $merge->absorbed_snapshot;
+        $snapshot['group']['updated_at']   = '2026-10-08 12:00:05';
+        $snapshot['journal']['updated_at'] = '2026-10-08 12:00:00';
+        $merge->absorbed_snapshot = $snapshot;
+        $merge->save();
+        $this->unmerge($id)->assertOk();
+        $this->assertOneStamp($abs['group'], 'absorbed group after unmerge');
+        $this->assertSame('2026-10-08 12:00:05', (string) DB::table('transaction_journals')->where('id', $abs['journal'])->value('updated_at'));
+    }
 
     /** core-1 M1 (repro testH): a counter account deleted after the merge. 409 with the ids, even with force; nothing changes. */
     public function testUnmergeOntoADeletedAccountIsRefusedEvenWithForce(): void
@@ -287,14 +372,17 @@ final class PairMergeFixesTest extends PairTestCase
         $abs   = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'IN1', 'date' => '2026-10-01']);
         $early = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'EARLY', 'date' => '2026-09-20']);
         $late  = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'LATE', 'date' => '2026-10-05']);
+        $edge  = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'EDGE', 'date' => '2026-10-01']);
         $dirty = static fn (array $ref): bool => (bool) DB::table('transactions')->where('transaction_journal_id', $ref['journal'])->where('amount', '>', 0)->value('balance_dirty');
         DB::table('transactions')->update(['balance_dirty' => false]);
         $id = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
         $this->assertTrue($dirty($late), 'a later row of the destination account is flagged after the merge');
         $this->assertFalse($dirty($early), 'an earlier row is not');
+        $this->assertTrue($dirty($edge), 'a row on the boundary day is flagged');
         DB::table('transactions')->update(['balance_dirty' => false]);
         $this->unmerge($id)->assertOk();
         $this->assertTrue($dirty($late), 'a later row is flagged after the unmerge');
+        $this->assertTrue($dirty($edge), 'the boundary row too');
         $this->assertFalse($dirty($early));
     }
 
@@ -349,6 +437,34 @@ final class PairMergeFixesTest extends PairTestCase
         }
         $zulu = static fn (string $at): string => Carbon::parse($at)->utc()->format('Y-m-d\TH:i:s\Z');
         $this->merge(['at' => $zulu($keep['at'])] + $keep, ['at' => $zulu($abs['at'])] + $abs)->assertOk();
+        foreach (['2026-10-08T17:00:00', '2026-10-08T17:00', '2026-10-08 17:00Z', 'garbage', '2026-10-08T17:00:00.Z'] as $bad) {
+            $res = $this->merge($keep, $abs, ['absorb_updated_at' => $bad])->assertStatus(422);
+            $this->assertArrayHasKey('absorb_updated_at', $res->json('errors'), $bad);
+        }
+    }
+
+    /** core-2 H1 (r2): the shapes java.time and Jackson send (zero seconds dropped, always Z, fractions) merge; the instant is what counts. */
+    public function testStampShapesRealClientsSendAreAccepted(): void
+    {
+        $instant = Carbon::parse('2026-10-08 17:00:00', 'UTC'); // = 12:00:00-05:00
+        $shapes  = [
+            ['2026-10-08T17:00Z', '2026-10-08T17:00Z'],
+            ['2026-10-08T17:00:00Z', '2026-10-08T17:00:00Z'],
+            ['2026-10-08T12:00-05:00', '2026-10-08T12:00:00-05:00'],
+            ['2026-10-08T12:00:00.500-05:00', '2026-10-08T17:00:00.5Z'],
+        ];
+        foreach ($shapes as $n => [$k, $a]) {
+            [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT-'.$n, 'IN-'.$n);
+            foreach ([$keep['group'], $abs['group']] as $g) {
+                DB::table('transaction_journals')->where('transaction_group_id', $g)->update(['updated_at' => $instant->copy()->timezone(config('app.timezone'))->toDateTimeString()]);
+                DB::table('transaction_groups')->where('id', $g)->update(['updated_at' => $instant->copy()->timezone(config('app.timezone'))->toDateTimeString()]);
+            }
+            $this->merge($keep, $abs, ['keep_updated_at' => $k, 'absorb_updated_at' => $a])->assertOk();
+        }
+        $this->assertSame(count($shapes), PairMerge::count());
+        // 30 seconds off is a different instant
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT-X', 'IN-X');
+        $this->merge($keep, $abs, ['keep_updated_at' => '2026-10-08T17:00:30Z'])->assertStatus(409)->assertJsonPath('reason', 'stale');
     }
 
     /** core-2 L2: evidence that cannot be stored is a 422 before the locks; a normal one is stored. */
