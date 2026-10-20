@@ -410,4 +410,84 @@ final class PairMergeStateTest extends PairTestCase
             'after the merge row is closed'      => ['update "pair_merges" set "unmerged_at"'],
         ];
     }
+
+    // ---------------------------------------------------------------- U07: archive and tag_count
+
+    public function testAHardDeleteOfTheKeptJournalLeavesTheSnapshotInTheArchive(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT1', 'IN1', ['tags' => ['k1']], ['tags' => ['k2'], 'notes' => 'abs note']);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $snapshot     = DB::table('pair_merges')->where('id', $id)->value('absorbed_snapshot');
+        $keepBefore   = DB::table('pair_merges')->where('id', $id)->value('keep_before');
+        $j            = $keep['journal'];
+        foreach (['journal_meta', 'transactions', 'tag_transaction_journal', 'category_transaction_journal', 'budget_transaction_journal', 'plaid_transaction_links'] as $table) {
+            DB::table($table)->where('transaction_journal_id', $j)->delete();
+        }
+        DB::table('notes')->where('noteable_id', $j)->where('noteable_type', TransactionJournal::class)->delete();
+        DB::table('transaction_journals')->where('id', $j)->delete();
+        DB::table('transaction_groups')->where('id', $keep['group'])->delete();
+        $this->assertSame(0, DB::table('pair_merges')->where('id', $id)->count(), 'the FK cascade (kept on purpose) must have removed the audit row');
+        $archive = DB::table('pair_merge_archives')->where('pair_merge_id', $id)->first();
+        $this->assertNotNull($archive);
+        $this->assertSame(json_decode((string) $snapshot, true), json_decode((string) $archive->absorbed_snapshot, true));
+        $this->assertSame(json_decode((string) $keepBefore, true), json_decode((string) $archive->keep_before, true));
+    }
+
+    public function testTheArchiveFollowsMergeAndUnmerge(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $this->assertSame(1, DB::table('pair_merge_archives')->count());
+        $this->assertNull(DB::table('pair_merge_archives')->where('pair_merge_id', $id)->value('unmerged_at'));
+        $this->unmerge($id)->assertOk();
+        $this->assertSame(1, DB::table('pair_merge_archives')->count());
+        $this->assertNotNull(DB::table('pair_merge_archives')->where('pair_merge_id', $id)->value('unmerged_at'));
+        $this->merge($this->ref($keep['group']), $this->ref($abs['group']))->assertOk();
+        $this->assertSame(2, DB::table('pair_merge_archives')->count());
+        $this->assertSame(2, DB::table('pair_merge_archives')->distinct()->count('pair_merge_id'));
+    }
+
+    public function testTheMigrationBackfillsTheArchiveForExistingMerges(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        DB::table('pair_merge_archives')->delete();
+        $migration = require base_path('database/migrations/2026_10_19_100000_pair_merge_overridden_and_archive.php');
+        $migration->up();
+        $this->assertSame(1, DB::table('pair_merge_archives')->where('pair_merge_id', $id)->count());
+        $this->assertSame(json_decode((string) DB::table('pair_merges')->where('id', $id)->value('absorbed_snapshot'), true), json_decode((string) DB::table('pair_merge_archives')->where('pair_merge_id', $id)->value('absorbed_snapshot'), true));
+        $migration->up();
+        $this->assertSame(1, DB::table('pair_merge_archives')->count());
+    }
+
+    private function tagCount(int $journal): int
+    {
+        return (int) DB::table('transaction_journals')->where('id', $journal)->value('tag_count');
+    }
+
+    public function testMergeSetsTagCountToTheRealCount(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT1', 'IN1', ['tags' => ['k1']], ['tags' => ['k2', 'k1']]);
+        $this->merge($keep, $abs)->assertOk();
+        $real = DB::table('tag_transaction_journal')->where('transaction_journal_id', $keep['journal'])->count();
+        $this->assertSame(2, $real);
+        $this->assertSame($real, $this->tagCount($keep['journal']));
+    }
+
+    public function testMergeWithNoTagsLeavesZero(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $this->merge($keep, $abs)->assertOk();
+        $this->assertSame(0, $this->tagCount($keep['journal']));
+    }
+
+    public function testUnmergeRestoresTheOldTagCount(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT1', 'IN1', ['tags' => ['k1']], ['tags' => ['k2']]);
+        DB::table('transaction_journals')->where('id', $keep['journal'])->update(['tag_count' => 7]);
+        $id = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $this->assertSame(2, $this->tagCount($keep['journal']));
+        $this->unmerge($id)->assertOk();
+        $this->assertSame(7, $this->tagCount($keep['journal']));
+    }
 }

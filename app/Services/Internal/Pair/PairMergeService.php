@@ -34,12 +34,14 @@ use FireflyIII\Events\Model\TransactionGroup\UpdatedSingleTransactionGroup;
 use FireflyIII\Events\Model\Webhook\WebhookMessagesRequestSending;
 use FireflyIII\Exceptions\PairRefusedException;
 use FireflyIII\Models\PairMerge;
+use FireflyIII\Models\PairMergeArchive;
 use FireflyIII\Models\PlaidTransactionLink;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Services\Internal\Destroy\JournalDestroyService;
 use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Arr;
 
 /**
  * Merges two single-link journals (the two sides of one own-account transfer) into ONE journal with TWO Plaid links,
@@ -228,6 +230,7 @@ class PairMergeService
                 'evidence'              => $evidence,
                 'merged_at'             => Carbon::now(),
             ]);
+            $this->archive($merge);
 
             return ['merge' => $merge, 'created' => true];
         });
@@ -270,7 +273,7 @@ class PairMergeService
                 throw new PairRefusedException(404, 'not_found');
             }
             if (null !== $merge->unmerged_at) {
-                return ['merge' => $merge, 'changed' => false, 'overridden' => []];
+                return ['merge' => $merge, 'changed' => false, 'overridden' => $merge->overridden ?? []];
             }
             $keepJournal = TransactionJournal::where('id', $merge->keep_journal_id)->first();
             if (null === $keepJournal) {
@@ -295,7 +298,9 @@ class PairMergeService
             );
             self::bumpJournalVersion($keepJ, self::versionOf($keepJ));
             $merge->unmerged_at = Carbon::now();
+            $merge->overridden  = [] === $diverged ? null : $diverged; // diverged is non-empty here only when force was set
             $merge->save();
+            $this->archive($merge);
 
             return ['merge' => $merge, 'changed' => true, 'overridden' => $diverged];
         });
@@ -554,6 +559,20 @@ class PairMergeService
     // ---------------------------------------------------------------------------------------------------------------
 
     /**
+     * Keep a copy of the audit row that a hard delete of keep cannot cascade into (same transaction as the write it copies).
+     */
+    private function archive(PairMerge $merge): void
+    {
+        PairMergeArchive::updateOrCreate(['pair_merge_id' => $merge->id], array_merge(
+            Arr::only($merge->getAttributes(), ['user_group_id', 'keep_group_id', 'keep_journal_id', 'absorbed_group_id', 'absorbed_journal_id', 'keep_after_updated_at', 'merged_at', 'unmerged_at']),
+            [
+                'keep_before' => $merge->keep_before, 'keep_after' => $merge->keep_after, 'absorbed_snapshot' => $merge->absorbed_snapshot,
+                'evidence' => $merge->evidence, 'overridden' => $merge->overridden, 'archived_at' => Carbon::now(),
+            ],
+        ));
+    }
+
+    /**
      * Everything the merge can change on keep, in a form that can be compared and restored.
      *
      * @return array<string, mixed>
@@ -687,8 +706,8 @@ class PairMergeService
         foreach ($tagsToAdd as $tagId) {
             DB::table('tag_transaction_journal')->insert(['tag_id' => $tagId, 'transaction_journal_id' => $keepJ]);
         }
-        // tag_count is a legacy column Firefly does not maintain (always 0), so it is not touched.
-        $update    = ['transaction_type_id' => $typeId];
+        // tag_count: Firefly never maintains it, but a merge that unions tags leaves keep with the real count (docs/core-pair-merge.md)
+        $update    = ['transaction_type_id' => $typeId, 'tag_count' => count($keep['tag_ids']) + count($tagsToAdd)];
         if (null === $keep['bill_id'] && null !== $absorbed['bill_id']) {
             $update['bill_id'] = $absorbed['bill_id'];
         }
@@ -875,6 +894,7 @@ class PairMergeService
         DB::table('transaction_journals')->where('id', $keepJ)->update([
             'transaction_type_id' => $before['transaction_type_id'],
             'bill_id'             => $before['bill_id'],
+            'tag_count'           => $before['tag_count'] ?? 0,
         ]);
         DB::table('transactions')->where('id', $before['destination_transaction_id'])->update(['account_id' => $before['destination_account_id'], 'balance_dirty' => true]);
         DB::table('transactions')->where('transaction_journal_id', $keepJ)->update(['balance_dirty' => true]);

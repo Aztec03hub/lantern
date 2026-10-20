@@ -590,4 +590,71 @@ final class PairMergeFixesTest extends PairTestCase
         $this->deleteJson(route('api.v1.plaid-links.pair.destroy', ['pairMerge' => $id]).'?force=banana')->assertStatus(409)->assertJsonPath('reason', 'diverged');
         $this->deleteJson(route('api.v1.plaid-links.pair.destroy', ['pairMerge' => $id]).'?force=1')->assertOk();
     }
+
+    // ---------------------------------------------------------------- U07: a forced unmerge keeps what it overwrote (A20)
+
+    /** @return array{0: int, 1: array, 2: array} a merge whose keep was edited afterwards (bill), so a plain unmerge is diverged */
+    private function divergedMerge(): array
+    {
+        $bills        = [$this->bill('Rent'), $this->bill('Phone')];
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        DB::table('transaction_journals')->where('id', $abs['journal'])->update(['bill_id' => $bills[0]]);
+        $id = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        DB::table('transaction_journals')->where('id', $keep['journal'])->update(['bill_id' => $bills[1]]);
+
+        return [$id, $keep, $abs];
+    }
+
+    public function testAForcedUnmergeStoresWhatItOverwrote(): void
+    {
+        [$id]   = $this->divergedMerge();
+        $forced = $this->unmerge($id, true)->assertOk();
+        $row    = DB::table('pair_merges')->where('id', $id)->first();
+        $this->assertNotNull($row->unmerged_at);
+        $stored = json_decode((string) $row->overridden, true);
+        $this->assertSame($forced->json('data.overridden'), $stored);
+        $this->assertSame(['bill'], array_column($stored, 'field'));
+        $this->assertSame($stored, json_decode((string) DB::table('pair_merge_archives')->where('pair_merge_id', $id)->value('overridden'), true));
+    }
+
+    public function testAnUnforcedUnmergeStoresNoOverriddenList(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $this->unmerge($id)->assertOk();
+        $this->assertNull(DB::table('pair_merges')->where('id', $id)->value('overridden'));
+        $this->assertNull(DB::table('pair_merge_archives')->where('pair_merge_id', $id)->value('overridden'));
+    }
+
+    public function testReplayOfAForcedUnmergeReturnsTheStoredList(): void
+    {
+        [$id]   = $this->divergedMerge();
+        $first  = $this->unmerge($id, true)->assertOk();
+        $after  = $this->dump();
+        $replay = $this->unmerge($id)->assertOk();
+        $this->assertSame($first->json('data.unmerged_at'), $replay->json('data.unmerged_at'));
+        $this->assertSame($first->json('data.overridden'), $replay->json('data.overridden'));
+        $this->assertNotEmpty($replay->json('data.overridden'));
+        $this->assertDumpsEqual($after, $this->dump());
+    }
+
+    public function testAForcedUnmergeThatFailsRecordsNothing(): void
+    {
+        [$id]    = $this->divergedMerge();
+        $archive = DB::table('pair_merge_archives')->where('pair_merge_id', $id)->first();
+        $fired   = false;
+        DB::listen(static function ($query) use (&$fired): void {
+            if (str_starts_with($query->sql, 'update "pair_merges" set "unmerged_at"')) {
+                $fired = true;
+
+                throw new \RuntimeException('injected failure');
+            }
+        });
+        $this->unmerge($id, true)->assertStatus(500);
+        $this->assertTrue($fired, 'the injection point was never reached');
+        $row = DB::table('pair_merges')->where('id', $id)->first();
+        $this->assertNull($row->overridden);
+        $this->assertNull($row->unmerged_at);
+        $this->assertEquals($archive, DB::table('pair_merge_archives')->where('pair_merge_id', $id)->first());
+    }
 }

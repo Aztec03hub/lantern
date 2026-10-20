@@ -41,13 +41,14 @@ use Illuminate\Database\Eloquent\Model;
  * @property null|array          $evidence
  * @property null|\Carbon\Carbon $merged_at
  * @property null|\Carbon\Carbon $unmerged_at
+ * @property null|array          $overridden what a forced unmerge overwrote (null = nothing)
  */
 class PairMerge extends Model
 {
     public $timestamps  = false;
     protected $fillable = [
         'user_group_id', 'keep_group_id', 'keep_journal_id', 'absorbed_group_id', 'absorbed_journal_id',
-        'keep_before', 'keep_after', 'absorbed_snapshot', 'keep_after_updated_at', 'evidence', 'merged_at', 'unmerged_at',
+        'keep_before', 'keep_after', 'absorbed_snapshot', 'keep_after_updated_at', 'evidence', 'merged_at', 'unmerged_at', 'overridden',
     ];
 
     protected function casts(): array
@@ -62,6 +63,7 @@ class PairMerge extends Model
             'keep_after'            => 'array',
             'absorbed_snapshot'     => 'array',
             'evidence'              => 'array',
+            'overridden'            => 'array',
             'keep_after_updated_at' => 'datetime',
             'merged_at'             => 'datetime',
             'unmerged_at'           => 'datetime',
