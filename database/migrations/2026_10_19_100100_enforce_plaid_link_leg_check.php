@@ -31,13 +31,13 @@ return new class extends Migration {
      */
     public function down(): void
     {
-        if ('pgsql' === DB::connection()->getDriverName() && Schema::hasTable('plaid_transaction_links')) {
-            DB::statement('ALTER TABLE plaid_transaction_links DROP CONSTRAINT IF EXISTS plaid_transaction_links_leg_check');
-        }
+        // nothing to undo: the CHECK belongs to the table definition (a fresh table has it from the create migration).
     }
 
     /**
      * Run the migrations.
+     *
+     * Run it by hand at deploy and check the exit code: Firefly's boot ignores a failing migrate. The MySQL branch is untested (the live database is Postgres).
      *
      * The create migration only makes the leg CHECK on a fresh table; a table made by its first version (a plain string
      * column) has none. Add it, but stop (and change nothing) if a row already breaks it.
@@ -55,9 +55,11 @@ return new class extends Migration {
         if ($this->present($driver)) {
             return;
         }
-        $bad = DB::table('plaid_transaction_links')->whereNotIn('leg', self::LEGS)->count();
-        if ($bad > 0) {
-            throw new RuntimeException(sprintf('plaid_transaction_links has %d row(s) with a leg outside single/source/destination; fix them before migrating', $bad));
+        $bad = DB::table('plaid_transaction_links')->whereNotIn('leg', self::LEGS)->orderBy('plaid_transaction_id')->limit(50)->get(['user_group_id', 'plaid_transaction_id', 'leg']);
+        if ($bad->isNotEmpty()) {
+            $list = $bad->map(static fn ($r): string => sprintf('%d/%s=%s', $r->user_group_id, $r->plaid_transaction_id, var_export($r->leg, true)))->implode(', ');
+
+            throw new RuntimeException(sprintf('plaid_transaction_links has %d row(s) (first 50 shown, group/plaid id=leg) with a leg outside single/source/destination: %s; fix them, then run migrate again', $bad->count(), $list));
         }
         if ('pgsql' === $driver) {
             DB::statement("ALTER TABLE plaid_transaction_links ADD CONSTRAINT plaid_transaction_links_leg_check CHECK (leg IN ('single','source','destination'))");
@@ -70,7 +72,7 @@ return new class extends Migration {
     private function present(string $driver): bool
     {
         if ('pgsql' === $driver) {
-            return (int) DB::selectOne("select count(*) as c from pg_constraint where conrelid = 'plaid_transaction_links'::regclass and contype = 'c' and pg_get_constraintdef(oid) like '%leg%'")->c > 0;
+            return (int) DB::selectOne("select count(*) as c from pg_constraint where conrelid = 'plaid_transaction_links'::regclass and conname = 'plaid_transaction_links_leg_check'")->c > 0;
         }
         $type = DB::selectOne("select column_type as t from information_schema.columns where table_schema = database() and table_name = 'plaid_transaction_links' and column_name = 'leg'");
 

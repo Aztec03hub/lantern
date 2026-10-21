@@ -99,11 +99,20 @@ final class PlaidLinkLegCheckTest extends TestCase
             $this->fail('the migration must refuse');
         } catch (\RuntimeException $e) {
             $this->assertStringContainsString('1 row', $e->getMessage());
+            $this->assertStringContainsString("1/P2='bogus'", $e->getMessage(), 'the message names the offending row');
         }
         $this->assertSame(2, DB::table('plaid_transaction_links')->count());
         $this->assertSame(0, $this->legChecks());
         $this->row('P3', 'bogus');
         $this->assertSame(3, DB::table('plaid_transaction_links')->count());
+    }
+
+    public function testAnUnrelatedCheckMentioningLegDoesNotStopTheRightOneBeingAdded(): void
+    {
+        $this->oldShape();
+        DB::statement("ALTER TABLE plaid_transaction_links ADD CONSTRAINT other_leg_note CHECK (leg <> 'x')");
+        $this->migrate();
+        $this->assertSame(1, (int) DB::selectOne("select count(*) as c from pg_constraint where conname = 'plaid_transaction_links_leg_check'")->c);
     }
 
     public function testTheLegMigrationDoesNothingWhenTheCheckExists(): void

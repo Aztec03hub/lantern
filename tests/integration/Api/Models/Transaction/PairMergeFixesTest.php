@@ -657,4 +657,29 @@ final class PairMergeFixesTest extends PairTestCase
         $this->assertNull($row->unmerged_at);
         $this->assertEquals($archive, DB::table('pair_merge_archives')->where('pair_merge_id', $id)->first());
     }
+
+    /** every archived column equals the pair_merges row, after merge, after a forced unmerge and after the backfill (json compared decoded) */
+    private function assertArchiveEqualsMerge(int|string $id): void
+    {
+        $m = (array) DB::table('pair_merges')->where('id', $id)->first();
+        $a = (array) DB::table('pair_merge_archives')->where('pair_merge_id', $id)->first();
+        $this->assertNotEmpty($a, 'no archive row');
+        foreach (['user_group_id', 'keep_group_id', 'keep_journal_id', 'absorbed_group_id', 'absorbed_journal_id', 'keep_before', 'keep_after', 'absorbed_snapshot', 'keep_after_updated_at', 'evidence', 'merged_at', 'unmerged_at', 'overridden'] as $col) {
+            $dec = static fn ($v) => is_string($v) && (str_starts_with($v, '{') || str_starts_with($v, '[')) ? json_decode($v, true) : $v;
+            $this->assertEquals($dec($m[$col]), $dec($a[$col]), 'column '.$col);
+        }
+    }
+
+    public function testTheArchiveRowEqualsThePairMergeRowAtEveryStage(): void
+    {
+        [$id] = $this->divergedMerge();
+        $this->assertNotNull(DB::table('pair_merges')->where('id', $id)->value('evidence'), 'the test needs evidence to compare');
+        $this->assertArchiveEqualsMerge($id);
+        $this->unmerge($id, true)->assertOk();
+        $this->assertNotNull(DB::table('pair_merges')->where('id', $id)->value('overridden'));
+        $this->assertArchiveEqualsMerge($id);
+        DB::table('pair_merge_archives')->delete();
+        (require base_path('database/migrations/2026_10_19_100000_pair_merge_overridden_and_archive.php'))->up();
+        $this->assertArchiveEqualsMerge($id);
+    }
 }
