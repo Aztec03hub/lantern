@@ -149,6 +149,10 @@ final class RunningBalanceRefreshTest extends TestCase
         parent::setUp();
         $this->user  = $this->createAuthenticatedUser();
         $this->user->roles()->attach((int) DB::table('roles')->where('name', 'owner')->value('id')); // instance admin, for api-admin
+        // creating the user can leave two use_running_balance rows (get-or-create has no unique key); the controller and
+        // the test read the first one Postgres returns, so start from exactly one row
+        DB::table('configuration')->where('name', 'use_running_balance')->delete();
+        AppConfiguration::set('use_running_balance', true);
         $this->actingAs($this->user, 'api');
         $this->asset = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset A', 'user_group_id' => $this->user->user_group_id]);
     }
