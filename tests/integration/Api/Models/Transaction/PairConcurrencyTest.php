@@ -563,45 +563,53 @@ final class PairConcurrencyTest extends PairTestCase
         // Each child opens its own on first use, the parent reconnects lazily afterwards.
         DB::disconnect();
         $outputs = [];
-        $pids    = [];
-        foreach ($jobs as $index => $job) {
-            $outputs[$index] = $this->flag();
-            $pid             = pcntl_fork();
-            $this->assertNotSame(-1, $pid, 'fork failed');
-            if (0 === $pid) {
-                $this->runChild($job, $go, $outputs[$index]);
+        $running = [];
+        try {
+            foreach ($jobs as $index => $job) {
+                $outputs[$index] = $this->flag();
+                $pid             = pcntl_fork();
+                $this->assertNotSame(-1, $pid, 'fork failed');
+                if (0 === $pid) {
+                    $this->runChild($job, $go, $outputs[$index]);
+                }
+                $running[$index] = $pid;
             }
-            $pids[$index] = $pid;
-        }
-        touch($go); // children poll the gate, so no settle delay is needed
-        $deadline = microtime(true) + 60;
-        $seen     = [];
-        $running  = $pids;
-        while ([] !== $running) {
-            foreach ($running as $index => $pid) {
-                if (0 !== pcntl_waitpid($pid, $status, WNOHANG)) {
-                    unset($running[$index]);
-                    // 'done': the holder lets go once a waiter has finished (it was refused while the holder still held)
-                    if ('done' === $releaseOn && 0 !== $index) {
+            touch($go); // children poll the gate, so no settle delay is needed
+            $deadline = microtime(true) + 60;
+            $seen     = [];
+            while ([] !== $running) {
+                foreach ($running as $index => $pid) {
+                    if (0 !== pcntl_waitpid($pid, $status, WNOHANG)) {
+                        unset($running[$index]);
+                        // a waiter that finished lets the holder go in both modes ('done' relies on it; 'queued' must not sit out the 30 s when nothing queued)
+                        if (0 !== $index) {
+                            touch($this->release);
+                        }
+                    }
+                }
+                if ([] === $running) {
+                    break;
+                }
+                if ([] !== $expectQueue && [] === array_intersect($seen, $expectQueue)) {
+                    // the parent reconnects lazily on its own socket; the children each opened theirs
+                    foreach (DB::select("select wait_event from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()") as $row) {
+                        $seen[] = (string) $row->wait_event;
+                    }
+                    // 'queued': the holder lets go once a backend was SEEN waiting on the expected lock
+                    if ('queued' === $releaseOn && [] !== array_intersect($seen, $expectQueue)) {
                         touch($this->release);
                     }
                 }
+                $this->assertLessThan($deadline, microtime(true), 'a child did not finish: deadlock or lost wake-up');
+                usleep(5000);
             }
-            if ([] === $running) {
-                break;
+        } finally {
+            // every exit path (a failed assertion included): free the holders and kill stragglers, so no child keeps its locks into the next test's TRUNCATE
+            touch($this->release);
+            foreach ($running as $pid) {
+                posix_kill($pid, SIGKILL);
+                pcntl_waitpid($pid, $status);
             }
-            if ([] !== $expectQueue && [] === array_intersect($seen, $expectQueue)) {
-                // the parent reconnects lazily on its own socket; the children each opened theirs
-                foreach (DB::select("select wait_event from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()") as $row) {
-                    $seen[] = (string) $row->wait_event;
-                }
-                // 'queued': the holder lets go once a backend was SEEN waiting on the expected lock
-                if ('queued' === $releaseOn && [] !== array_intersect($seen, $expectQueue)) {
-                    touch($this->release);
-                }
-            }
-            $this->assertLessThan($deadline, microtime(true), 'a child did not finish: deadlock or lost wake-up');
-            usleep(5000);
         }
         if ([] !== $expectQueue && 'queued' === $releaseOn) {
             $this->assertNotSame([], array_intersect($seen, $expectQueue), 'no backend was seen waiting on '.implode('/', $expectQueue).' (saw: '.implode(',', array_unique($seen)).'): the second request did not queue');
