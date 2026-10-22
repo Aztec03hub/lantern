@@ -41,7 +41,7 @@ use Override;
  * advisory locks and row locks are the real ones. The parent only prepares data (committed, no wrapping transaction)
  * and judges the final state. Children are killed with SIGKILL after reporting, so the parent's socket is never closed.
  *
- * The "held" scenarios are deterministic: the first child sleeps right after it took its locks, the second child
+ * The "held" scenarios are deterministic: the first child holds right after it took its locks, until the parent has seen the second one queue (or finish), the second child
  * starts only once the first reports that it holds them, so the second MUST queue behind the first.
  *
  * The 20-round probes run all rounds at once, every round with its OWN user: Firefly's PUT rewrites the user's
@@ -57,6 +57,9 @@ final class PairConcurrencyTest extends PairTestCase
 
     /** @var array<int, string> */
     private array $files = [];
+
+    /** The holders keep their locks until the parent touches this file (see parallel()). */
+    private string $release = '';
 
     public function testTwoSimultaneousMergesOfTheSamePairAreOneMergeAndTheLoserGetsTheSameId(): void
     {
@@ -80,7 +83,7 @@ final class PairConcurrencyTest extends PairTestCase
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->mergeHolding($keep, $abs, $held, 600),
+            fn (): array => $this->mergeHolding($keep, $abs, $held),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
         ], ['advisory']);
         $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
@@ -147,7 +150,7 @@ final class PairConcurrencyTest extends PairTestCase
         $abs2 = $this->single(['type' => 'deposit', 'account' => $this->loanA, 'plaid' => 'D2']);
         $held = $this->flag();
         $out  = $this->parallel([
-            fn (): array => $this->mergeHolding($keep, $abs1, $held, 600),
+            fn (): array => $this->mergeHolding($keep, $abs1, $held),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs2)),
         ], ['advisory']);
         $this->assertSame([200, 409], array_column($out, 'status'), json_encode($out));
@@ -189,7 +192,7 @@ final class PairConcurrencyTest extends PairTestCase
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->putHolding($keep, 'edited', $held, 600),
+            fn (): array => $this->putHolding($keep, 'edited', $held),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
         ], ['transactionid', 'tuple']);
         $this->assertSame([200, 409], array_column($out, 'status'), json_encode($out));
@@ -205,7 +208,7 @@ final class PairConcurrencyTest extends PairTestCase
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->mergeHolding($keep, $abs, $held, 600),
+            fn (): array => $this->mergeHolding($keep, $abs, $held),
             fn (): array => $this->after($held, fn (): array => $this->doPut($this->user, $keep, 'edited after')),
         ], ['transactionid', 'tuple']);
         $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
@@ -221,7 +224,7 @@ final class PairConcurrencyTest extends PairTestCase
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->reconcileHolding($keep, $held, 600),
+            fn (): array => $this->reconcileHolding($keep, $held),
             fn (): array => $this->after($held, fn (): array => $this->doMerge($this->user, $keep, $abs)),
         ], ['transactionid', 'tuple']);
         $this->assertSame(409, $out[1]['status'], json_encode($out));
@@ -235,9 +238,9 @@ final class PairConcurrencyTest extends PairTestCase
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->reconcileHolding($keep, $held, 2500),
+            fn (): array => $this->reconcileHolding($keep, $held),
             fn (): array => $this->after($held, $this->withLockTimeout(fn (): array => $this->doMerge($this->user, $keep, $abs), 400)),
-        ], ['transactionid', 'tuple']);
+        ], [], 'done');
         $this->assertBusy($out[1]);
         $this->assertSame(0, PairMerge::count());
         $this->assertSame(['OUT1' => 'single'], $this->linkLegs($keep['journal']));
@@ -255,9 +258,9 @@ final class PairConcurrencyTest extends PairTestCase
         $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
         $held         = $this->flag();
         $out          = $this->parallel([
-            fn (): array => $this->reconcileHolding($keep, $held, 2500),
+            fn (): array => $this->reconcileHolding($keep, $held),
             fn (): array => $this->after($held, $this->withLockTimeout(fn (): array => $this->doUnmerge($this->user, (string) $id), 400)),
-        ], ['transactionid', 'tuple']);
+        ], [], 'done');
         $this->assertBusy($out[1]);
         $this->assertNull(PairMerge::find($id)->unmerged_at);
         $this->actingAs($this->user, 'api');
@@ -321,17 +324,17 @@ final class PairConcurrencyTest extends PairTestCase
         $later = $this->fastSingle(['user' => $this->user, 'type' => 'withdrawal', 'account' => $this->assetA, 'plaid' => 'LATER', 'amount' => '7.00', 'date' => '2099-01-01']);
         $held  = $this->flag();
         $out   = $this->parallel([
-            static function () use ($later, $held): array {
-                DB::transaction(static function () use ($later, $held): void {
+            function () use ($later, $held): array {
+                DB::transaction(function () use ($later, $held): void {
                     DB::table('transactions')->where('transaction_journal_id', $later['journal'])->lock('for update')->pluck('id');
                     touch($held);
-                    usleep(3000000);
+                    $this->holdUntilReleased();
                 });
 
                 return ['status' => 200];
             },
             fn (): array => $this->after($held, function () use ($later): array {
-                DB::statement("set lock_timeout = '8000ms'");
+                DB::statement("set lock_timeout = '3000ms'");
                 $started = $this->nowMs();
                 DB::transaction(function () use ($later): void {
                     $method = new \ReflectionMethod(PairMergeService::class, 'flagLaterRows');
@@ -340,8 +343,9 @@ final class PairConcurrencyTest extends PairTestCase
 
                 return ['status' => 200, 'ms' => $this->nowMs() - $started];
             }),
-        ]);
-        $this->assertLessThan(2000, $out[1]['ms'], 'the dirty-flag pass waited for the held row instead of skipping it');
+        ], [], 'done');
+        // no time assertion: the holder keeps the row until this child returns, so a blocking FOR UPDATE runs into lock_timeout and parallel() fails on the crash
+        $this->assertArrayHasKey('ms', $out[1]);
     }
 
     // --------------------------------------------------------------------------------- B27 helpers
@@ -375,9 +379,9 @@ final class PairConcurrencyTest extends PairTestCase
         DB::table('transaction_journals')->where('transaction_group_id', $keep['group'])->update(['updated_at' => $start->toDateTimeString()]);
         $held = $this->flag();
         $out  = $this->parallel([
-            fn (): array => $this->putHolding($keep, 'first', $held, 600),
+            fn (): array => $this->putHolding($keep, 'first', $held),
             fn (): array => $this->after($held, fn (): array => $this->doPut($this->user, $keep, 'second')),
-        ]);
+        ], ['transactionid', 'tuple']);
         $this->assertSame([200, 200], array_column($out, 'status'), json_encode($out));
         $this->assertSame('second', TransactionJournal::find($keep['journal'])->description);
         $this->assertSame($start->copy()->addSeconds(2)->toDateTimeString(), (string) DB::table('transaction_groups')->where('id', $keep['group'])->value('updated_at'));
@@ -463,6 +467,7 @@ final class PairConcurrencyTest extends PairTestCase
         if (!function_exists('pcntl_fork') || !function_exists('posix_kill')) {
             $this->markTestSkipped('pcntl and posix are required to fork the competing requests');
         }
+        $this->release = $this->flag(); // before any fork, so every child inherits the path
     }
 
     #[Override]
@@ -543,14 +548,15 @@ final class PairConcurrencyTest extends PairTestCase
      * The queue check proves that SOME backend waited on a lock of that kind, not which one: unambiguous with two children. With a third
      * connection (a poller, a listener), name each child's application_name and filter on it.
      *
-     * @param array<int, callable():array<string,mixed>> $jobs
+     * @param array<int, callable():array<string,mixed>> $jobs      job 0 is the holder when the scenario has one
+     * @param string                                     $releaseOn 'queued' (default): the holder lets go once a backend was seen waiting; 'done': once any other job finished
      * @param array<int, string>                         $expectQueue pg_stat_activity wait_event names (Lock type), at least one of which the parent must SEE
      *                                                                 while the jobs run: proof that the second request really queued on that kind of lock,
      *                                                                 with no timing threshold. 'transactionid'/'tuple' = a row lock, 'advisory' = an advisory lock
      *
      * @return array<int, array<string, mixed>>
      */
-    private function parallel(array $jobs, array $expectQueue = []): array
+    private function parallel(array $jobs, array $expectQueue = [], string $releaseOn = 'queued'): array
     {
         $go      = $this->flag();
         // close the parent's connection BEFORE forking: a PDO shared by two processes interleaves their protocol messages.
@@ -567,23 +573,37 @@ final class PairConcurrencyTest extends PairTestCase
             }
             $pids[$index] = $pid;
         }
-        usleep(300000); // every child is forked and waits at the gate
-        touch($go);
+        touch($go); // children poll the gate, so no settle delay is needed
         $deadline = microtime(true) + 60;
         $seen     = [];
-        foreach ($pids as $pid) {
-            while (0 === pcntl_waitpid($pid, $status, WNOHANG)) {
-                if ([] !== $expectQueue && [] === array_intersect($seen, $expectQueue)) {
-                    // the parent reconnects lazily on its own socket; the children each opened theirs
-                    foreach (DB::select("select wait_event from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()") as $row) {
-                        $seen[] = (string) $row->wait_event;
+        $running  = $pids;
+        while ([] !== $running) {
+            foreach ($running as $index => $pid) {
+                if (0 !== pcntl_waitpid($pid, $status, WNOHANG)) {
+                    unset($running[$index]);
+                    // 'done': the holder lets go once a waiter has finished (it was refused while the holder still held)
+                    if ('done' === $releaseOn && 0 !== $index) {
+                        touch($this->release);
                     }
                 }
-                $this->assertLessThan($deadline, microtime(true), 'a child did not finish: deadlock or lost wake-up');
-                usleep(5000);
             }
+            if ([] === $running) {
+                break;
+            }
+            if ([] !== $expectQueue && [] === array_intersect($seen, $expectQueue)) {
+                // the parent reconnects lazily on its own socket; the children each opened theirs
+                foreach (DB::select("select wait_event from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()") as $row) {
+                    $seen[] = (string) $row->wait_event;
+                }
+                // 'queued': the holder lets go once a backend was SEEN waiting on the expected lock
+                if ('queued' === $releaseOn && [] !== array_intersect($seen, $expectQueue)) {
+                    touch($this->release);
+                }
+            }
+            $this->assertLessThan($deadline, microtime(true), 'a child did not finish: deadlock or lost wake-up');
+            usleep(5000);
         }
-        if ([] !== $expectQueue) {
+        if ([] !== $expectQueue && 'queued' === $releaseOn) {
             $this->assertNotSame([], array_intersect($seen, $expectQueue), 'no backend was seen waiting on '.implode('/', $expectQueue).' (saw: '.implode(',', array_unique($seen)).'): the second request did not queue');
         }
         $results = [];
@@ -638,13 +658,28 @@ final class PairConcurrencyTest extends PairTestCase
         return ['status' => $response->getStatusCode(), 'id' => $response->json('data.pair_merge_id'), 'reason' => $response->json('reason'), 'message' => $response->json('message'), 'retry' => $response->json('retry'), 'retry_after' => $response->headers->get('Retry-After'), 'started_ms' => $started, 'finished_ms' => $this->nowMs()];
     }
 
-    /** A merge that, once it holds its locks, tells the others and sleeps. */
-    private function mergeHolding(array $keep, array $abs, string $flag, int $sleepMs): array
+    /** A merge that, once it holds its locks, tells the others and holds until released. */
+    private function mergeHolding(array $keep, array $abs, string $flag): array
     {
-        return $this->doMerge($this->user, $keep, $abs, static function () use ($flag, $sleepMs): void {
+        return $this->doMerge($this->user, $keep, $abs, function () use ($flag): void {
             touch($flag);
-            usleep($sleepMs * 1000);
+            $this->holdUntilReleased();
         });
+    }
+
+    /** Hold (locks stay taken) until the parent touches the release file; 30 s is far above any normal run, a missed release shows as the parent's 60 s deadline assertion. */
+    private function holdUntilReleased(): void
+    {
+        $deadline = microtime(true) + 30;
+        while (!is_file($this->release) && microtime(true) < $deadline) {
+            usleep(1000);
+        }
+    }
+
+    /** Only the forced proof sets this (scripts/test-pgsql.sh passes it through): delays the waiter, to show the test no longer depends on its start-up time. */
+    private function stallMs(): int
+    {
+        return (int) (getenv('PAIR_TEST_STALL_MS') ?: 0);
     }
 
     /** Wait for the first child to hold its locks, then run the job. */
@@ -654,7 +689,7 @@ final class PairConcurrencyTest extends PairTestCase
         while (!is_file($flag) && microtime(true) < $deadline) {
             usleep(1000);
         }
-        usleep(50000);
+        usleep($this->stallMs() * 1000);
 
         return $job();
     }
@@ -679,20 +714,20 @@ final class PairConcurrencyTest extends PairTestCase
     }
 
     /** A PUT that holds the journal row (its transaction is open) after its first write, and sleeps. */
-    private function putHolding(array $keep, string $description, string $flag, int $sleepMs): array
+    private function putHolding(array $keep, string $description, string $flag): array
     {
-        return $this->doPut($this->user, $keep, $description, static function () use ($flag, $sleepMs): void {
+        return $this->doPut($this->user, $keep, $description, function () use ($flag): void {
             touch($flag);
-            usleep($sleepMs * 1000);
+            $this->holdUntilReleased();
         });
     }
 
-    private function reconcileHolding(array $keep, string $flag, int $sleepMs): array
+    private function reconcileHolding(array $keep, string $flag): array
     {
-        DB::transaction(static function () use ($keep, $flag, $sleepMs): void {
+        DB::transaction(function () use ($keep, $flag): void {
             DB::table('transactions')->where('transaction_journal_id', $keep['journal'])->update(['reconciled' => true]);
             touch($flag);
-            usleep($sleepMs * 1000);
+            $this->holdUntilReleased();
         });
 
         return ['status' => 200, 'id' => null, 'reason' => null];
