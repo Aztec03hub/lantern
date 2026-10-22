@@ -1,7 +1,7 @@
 <?php
 
 /*
- * PlaidLinkTest.php
+ * PairDriverGuardTest.php
  *
  * This file is part of Firefly III (https://github.com/firefly-iii).
  *

@@ -28,8 +28,8 @@ use FireflyIII\Models\Account;
 use FireflyIII\Models\PairMerge;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Support\Models\AccountBalanceCalculator;
-use Illuminate\Support\Collection;
 use FireflyIII\User;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Override;
 
@@ -285,6 +285,7 @@ final class PairConcurrencyTest extends PairTestCase
             fn (array $c): array => [fn (): array => $this->doMerge($c['user'], $c['keep1'], $c['abs1']), fn (): array => $this->doMerge($c['user'], $c['keep2'], $c['abs2'])],
             function (int $i, array $c, array $out): void {
                 $this->assertSame([200, 200], array_column($out, 'status'), 'round '.$i.' (a 503 here means the merges blocked each other) '.json_encode($out));
+                $this->assertLessThan(min(array_column($out, 'finished_ms')), max(array_column($out, 'started_ms')), 'round '.$i.': the two merges did not overlap, so the race was not exercised '.json_encode($out));
                 foreach (['a', 'b'] as $k) {
                     foreach (DB::table('transactions')->where('account_id', $c[$k]->id)->whereNull('deleted_at')->get(['id', 'balance_before', 'balance_after']) as $row) {
                         $this->snap[$i][$k][$row->id] = [(string) $row->balance_before, (string) $row->balance_after];
