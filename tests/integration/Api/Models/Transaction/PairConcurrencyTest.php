@@ -26,6 +26,7 @@ namespace Tests\integration\Api\Models\Transaction;
 use FireflyIII\Enums\AccountTypeEnum;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\PairMerge;
+use FireflyIII\Services\Internal\Pair\PairMergeService;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Support\Models\AccountBalanceCalculator;
 use FireflyIII\User;
@@ -312,6 +313,35 @@ final class PairConcurrencyTest extends PairTestCase
                 $this->assertSame(0, bccomp($sum, (string) $last, 2), 'round '.$i.' account '.$accountId.' last balance is not the sum of the amounts');
             }
         }
+    }
+
+    /** The dirty-flag pass takes SKIP LOCKED: a later row another transaction holds is skipped at once. A blocking FOR UPDATE would sit until the holder commits (the merge as a whole cannot show this, its balance recalculation writes the held row anyway). */
+    public function testFlagLaterRowsSkipsARowAnotherTransactionHoldsInsteadOfWaiting(): void
+    {
+        $later = $this->fastSingle(['user' => $this->user, 'type' => 'withdrawal', 'account' => $this->assetA, 'plaid' => 'LATER', 'amount' => '7.00', 'date' => '2099-01-01']);
+        $held  = $this->flag();
+        $out   = $this->parallel([
+            static function () use ($later, $held): array {
+                DB::transaction(static function () use ($later, $held): void {
+                    DB::table('transactions')->where('transaction_journal_id', $later['journal'])->lock('for update')->pluck('id');
+                    touch($held);
+                    usleep(3000000);
+                });
+
+                return ['status' => 200];
+            },
+            fn (): array => $this->after($held, function () use ($later): array {
+                DB::statement("set lock_timeout = '8000ms'");
+                $started = $this->nowMs();
+                DB::transaction(function () use ($later): void {
+                    $method = new \ReflectionMethod(PairMergeService::class, 'flagLaterRows');
+                    $method->invoke(app(PairMergeService::class), [$this->assetA->id], '2026-01-01');
+                });
+
+                return ['status' => 200, 'ms' => $this->nowMs() - $started];
+            }),
+        ]);
+        $this->assertLessThan(2000, $out[1]['ms'], 'the dirty-flag pass waited for the held row instead of skipping it');
     }
 
     // --------------------------------------------------------------------------------- B27 helpers
