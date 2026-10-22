@@ -27,6 +27,8 @@ use FireflyIII\Enums\AccountTypeEnum;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\PairMerge;
 use FireflyIII\Models\TransactionJournal;
+use FireflyIII\Support\Models\AccountBalanceCalculator;
+use Illuminate\Support\Collection;
 use FireflyIII\User;
 use Illuminate\Support\Facades\DB;
 use Override;
@@ -226,6 +228,113 @@ final class PairConcurrencyTest extends PairTestCase
         $this->assertSame(0, PairMerge::count());
     }
 
+    /** B27: Postgres itself times out the lock wait (per-connection lock_timeout on the waiter only), and the answer is 503 busy with nothing written. */
+    public function testARealLockTimeoutIsAnswered503BusyAndNothingIsWritten(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $held         = $this->flag();
+        $out          = $this->parallel([
+            fn (): array => $this->reconcileHolding($keep, $held, 2500),
+            fn (): array => $this->after($held, $this->withLockTimeout(fn (): array => $this->doMerge($this->user, $keep, $abs), 400)),
+        ], ['transactionid', 'tuple']);
+        $this->assertBusy($out[1]);
+        $this->assertSame(0, PairMerge::count());
+        $this->assertSame(['OUT1' => 'single'], $this->linkLegs($keep['journal']));
+        $this->assertSame(['IN1' => 'single'], $this->linkLegs($abs['journal']));
+        $this->assertSame(0, DB::table('transaction_groups')->whereIn('id', [$keep['group'], $abs['group']])->whereNotNull('deleted_at')->count());
+        // the holder committed its reconcile, so undo it: the retry must then work now that the lock is gone
+        DB::table('transactions')->where('transaction_journal_id', $keep['journal'])->update(['reconciled' => false]);
+        $this->actingAs($this->user, 'api');
+        $this->merge($keep, $abs)->assertOk();
+    }
+
+    public function testARealLockTimeoutOnUnmergeIsAnswered503Busy(): void
+    {
+        [$keep, $abs] = $this->pair($this->assetA, $this->assetB);
+        $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        $held         = $this->flag();
+        $out          = $this->parallel([
+            fn (): array => $this->reconcileHolding($keep, $held, 2500),
+            fn (): array => $this->after($held, $this->withLockTimeout(fn (): array => $this->doUnmerge($this->user, (string) $id), 400)),
+        ], ['transactionid', 'tuple']);
+        $this->assertBusy($out[1]);
+        $this->assertNull(PairMerge::find($id)->unmerged_at);
+        $this->actingAs($this->user, 'api');
+        $this->unmerge($id)->assertOk();
+    }
+
+    /** E26: two merges on the same two accounts, with earlier and later rows around them; afterwards every stored running balance equals a forced fresh recomputation. */
+    public function testTwoMergesOnTheSameAccountsLeaveEveryRunningBalanceRight(): void
+    {
+        $this->snap = [];
+        $this->raceRounds(
+            function (array $r, int $i): array {
+                $u   = $r['user'];
+                $c   = [
+                    'keep1' => $this->fastSingle(['user' => $u, 'type' => 'withdrawal', 'account' => $r['a'], 'plaid' => 'K1-'.$i, 'amount' => '30.00', 'date' => '2026-10-03']),
+                    'abs1'  => $this->fastSingle(['user' => $u, 'type' => 'deposit', 'account' => $r['b'], 'plaid' => 'D1-'.$i, 'amount' => '30.00', 'date' => '2026-10-03']),
+                    'keep2' => $this->fastSingle(['user' => $u, 'type' => 'withdrawal', 'account' => $r['a'], 'plaid' => 'K2-'.$i, 'amount' => '12.00', 'date' => '2026-10-04']),
+                    'abs2'  => $this->fastSingle(['user' => $u, 'type' => 'deposit', 'account' => $r['b'], 'plaid' => 'D2-'.$i, 'amount' => '12.00', 'date' => '2026-10-04']),
+                ];
+                $this->fastSingle(['user' => $u, 'type' => 'deposit', 'account' => $r['b'], 'plaid' => 'E-'.$i, 'amount' => '100.00', 'date' => '2026-09-20']);
+                $this->fastSingle(['user' => $u, 'type' => 'deposit', 'account' => $r['b'], 'plaid' => 'L-'.$i, 'amount' => '7.00', 'date' => '2026-10-09']);
+                AccountBalanceCalculator::optimizedCalculation(new Collection([$r['a'], $r['b']]));
+
+                return $c + ['a' => $r['a'], 'b' => $r['b']];
+            },
+            fn (array $c): array => [fn (): array => $this->doMerge($c['user'], $c['keep1'], $c['abs1']), fn (): array => $this->doMerge($c['user'], $c['keep2'], $c['abs2'])],
+            function (int $i, array $c, array $out): void {
+                $this->assertSame([200, 200], array_column($out, 'status'), 'round '.$i.' (a 503 here means the merges blocked each other) '.json_encode($out));
+                foreach (['a', 'b'] as $k) {
+                    foreach (DB::table('transactions')->where('account_id', $c[$k]->id)->whereNull('deleted_at')->get(['id', 'balance_before', 'balance_after']) as $row) {
+                        $this->snap[$i][$k][$row->id] = [(string) $row->balance_before, (string) $row->balance_after];
+                    }
+                }
+                $this->snap[$i]['ids'] = [$c['a']->id, $c['b']->id];
+            },
+        );
+        $this->assertNotSame([], $this->snap);
+        AccountBalanceCalculator::recalculateAll(true);
+        foreach ($this->snap as $i => $round) {
+            foreach (['a', 'b'] as $k) {
+                $this->assertNotSame([], $round[$k], 'round '.$i.' account '.$k.' had no rows');
+                foreach ($round[$k] as $id => [$before, $after]) {
+                    $fresh = DB::table('transactions')->where('id', $id)->first(['balance_before', 'balance_after']);
+                    $this->assertNotNull($fresh, 'round '.$i.' row '.$id.' vanished');
+                    $this->assertSame(0, bccomp($before, (string) $fresh->balance_before, 2), sprintf('round %d account %s row %d balance_before stored %s fresh %s', $i, $k, $id, $before, $fresh->balance_before));
+                    $this->assertSame(0, bccomp($after, (string) $fresh->balance_after, 2), sprintf('round %d account %s row %d balance_after stored %s fresh %s', $i, $k, $id, $after, $fresh->balance_after));
+                }
+            }
+            foreach ($round['ids'] as $accountId) {
+                $sum  = (string) DB::table('transactions')->where('account_id', $accountId)->whereNull('deleted_at')->sum('amount');
+                $last = DB::table('transactions as t')->join('transaction_journals as j', 'j.id', '=', 't.transaction_journal_id')->where('t.account_id', $accountId)->whereNull('t.deleted_at')->orderByDesc('j.date')->orderByDesc('t.id')->value('t.balance_after');
+                $this->assertSame(0, bccomp($sum, (string) $last, 2), 'round '.$i.' account '.$accountId.' last balance is not the sum of the amounts');
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------------------- B27 helpers
+
+    /** The waiter's own connection (it is forked) gets a short lock_timeout; the holder and the parent are not affected. */
+    private function withLockTimeout(callable $job, int $ms): callable
+    {
+        return static function () use ($job, $ms): array {
+            DB::statement("set lock_timeout = '{$ms}ms'");
+
+            return $job();
+        };
+    }
+
+    /** @param array<string, mixed> $r */
+    private function assertBusy(array $r): void
+    {
+        $this->assertSame(503, $r['status'], json_encode($r));
+        $this->assertSame('busy', $r['reason']);
+        $this->assertTrue($r['retry']);
+        $this->assertSame('1', $r['retry_after']);
+        $this->assertStringNotContainsString('SQLSTATE', (string) $r['message']);
+    }
+
     /** core-2 N1 (r3): a REAL race for the PUT lock (r2 L1): PUT 2 queues behind PUT 1 and must bump from PUT 1's stamp, so the final stamp is two steps past the start. */
     public function testTwoQueuedPutsMoveTheStampTwoSteps(): void
     {
@@ -303,6 +412,9 @@ final class PairConcurrencyTest extends PairTestCase
             },
         );
     }
+
+    /** @var array<int, array<string, mixed>> */
+    private array $snap = [];
 
     #[Override]
     public function beginDatabaseTransaction(): void
@@ -492,7 +604,7 @@ final class PairConcurrencyTest extends PairTestCase
         }
         $response = $this->merge($keep, $abs);
 
-        return ['status' => $response->getStatusCode(), 'id' => $response->json('data.pair_merge_id'), 'reason' => $response->json('reason'), 'started_ms' => $started, 'finished_ms' => $this->nowMs()];
+        return ['status' => $response->getStatusCode(), 'id' => $response->json('data.pair_merge_id'), 'reason' => $response->json('reason'), 'message' => $response->json('message'), 'retry' => $response->json('retry'), 'retry_after' => $response->headers->get('Retry-After'), 'started_ms' => $started, 'finished_ms' => $this->nowMs()];
     }
 
     /** A merge that, once it holds its locks, tells the others and sleeps. */
@@ -561,7 +673,7 @@ final class PairConcurrencyTest extends PairTestCase
         $this->actingAs($as, 'api');
         $response = $this->unmerge($id);
 
-        return ['status' => $response->getStatusCode(), 'id' => $response->json('data.pair_merge_id'), 'reason' => $response->json('reason')];
+        return ['status' => $response->getStatusCode(), 'id' => $response->json('data.pair_merge_id'), 'reason' => $response->json('reason'), 'message' => $response->json('message'), 'retry' => $response->json('retry'), 'retry_after' => $response->headers->get('Retry-After')];
     }
 
     private function nowMs(): int

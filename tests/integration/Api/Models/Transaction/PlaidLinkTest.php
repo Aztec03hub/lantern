@@ -24,6 +24,9 @@ declare(strict_types=1);
 namespace Tests\integration\Api\Models\Transaction;
 
 use FireflyIII\Enums\AccountTypeEnum;
+use FireflyIII\Events\Model\TransactionGroup\CreatedSingleTransactionGroup;
+use FireflyIII\Events\Model\TransactionGroup\UpdatedSingleTransactionGroup;
+use FireflyIII\Events\Model\Webhook\WebhookMessagesRequestSending;
 use FireflyIII\Exceptions\PlaidLinkConflictException;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\PlaidTransactionLink;
@@ -32,6 +35,8 @@ use FireflyIII\Services\Internal\Support\PlaidLinkService;
 use FireflyIII\User;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Override;
 use Tests\integration\TestCase;
 
@@ -487,6 +492,103 @@ final class PlaidLinkTest extends TestCase
         $this->expectException(QueryException::class);
         [, $j1] = $this->splitGroup();
         PlaidTransactionLink::query()->insert(['user_group_id' => $this->user->user_group_id, 'plaid_transaction_id' => 'E1', 'transaction_journal_id' => $j1, 'leg' => 'bogus']);
+    }
+
+    /** C23.1: a builder-level delete runs no model event, so only the foreign key can remove the links. */
+    public function testHardDeleteOfAJournalRemovesItsLinksThroughTheForeignKey(): void
+    {
+        if ('pgsql' !== DB::connection()->getDriverName()) {
+            $this->markTestSkipped('SQLite does not enforce foreign keys in this suite');
+        }
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+        $id = (int) TransactionJournal::value('id');
+        $this->assertSame(1, PlaidTransactionLink::count());
+        TransactionJournal::whereKey($id)->forceDelete();
+        $this->assertSame(0, PlaidTransactionLink::count());
+        $this->assertSame(0, DB::table('transactions')->where('transaction_journal_id', $id)->count());
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+        $this->assertSame(1, PlaidTransactionLink::count());
+    }
+
+    public function testForceDeleteThroughTheModelFreesTheLinksToo(): void
+    {
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+        TransactionJournal::find(TransactionJournal::value('id'))->forceDelete();
+        $this->assertSame(0, PlaidTransactionLink::count());
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+        $this->assertSame(1, PlaidTransactionLink::count());
+    }
+
+    public function testPurgeEndpointKeepsTheLinksGoneAndTheIdImportable(): void
+    {
+        $a = $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->json('data.id');
+        $this->deleteJson(route('api.v1.transactions.delete', ['transactionGroup' => $a]))->assertNoContent();
+        $this->deleteJson(route('api.v1.data.purge'))->assertStatus(204);
+        $this->assertSame(0, TransactionJournal::withTrashed()->count());
+        $this->assertSame(0, PlaidTransactionLink::count());
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+    }
+
+    /** C23.2 schema side: the CHECK exists in the migrated database and refuses a bad leg with SQLSTATE 23514. */
+    public function testTheMigratedSchemaCarriesTheLegCheckAndRefusesABadLeg(): void
+    {
+        if ('pgsql' !== DB::connection()->getDriverName()) {
+            $this->markTestSkipped('the leg CHECK is a Postgres constraint');
+        }
+        $names = array_column(DB::select("select conname from pg_constraint where conrelid = 'plaid_transaction_links'::regclass and contype = 'c'"), 'conname');
+        $this->assertContains('plaid_transaction_links_leg_check', $names);
+        [, $j1] = $this->splitGroup();
+        $row = fn (string $id, string $leg) => ['user_group_id' => $this->user->user_group_id, 'plaid_transaction_id' => $id, 'transaction_journal_id' => $j1, 'leg' => $leg];
+        foreach (['single', 'source', 'destination'] as $i => $leg) {
+            PlaidTransactionLink::query()->insert($row('LEG'.$i, $leg));
+        }
+        // a failed statement aborts the surrounding test transaction on Postgres, so use a savepoint
+        DB::beginTransaction();
+        try {
+            PlaidTransactionLink::query()->insert($row('LEGBAD', 'bogus'));
+            $this->fail('bogus leg was accepted');
+        } catch (QueryException $e) {
+            $this->assertSame('23514', $e->errorInfo[0]);
+        } finally {
+            DB::rollBack();
+        }
+    }
+
+    /** @return array<string, mixed> */
+    private function loudPayload(string $plaidId): array
+    {
+        return ['apply_rules' => true, 'fire_webhooks' => true] + $this->payload($plaidId);
+    }
+
+    public function testACreateThatConflictsFiresNoRuleOrWebhookEvent(): void
+    {
+        Event::fake([CreatedSingleTransactionGroup::class, UpdatedSingleTransactionGroup::class, WebhookMessagesRequestSending::class]);
+        $this->postJson(route('api.v1.transactions.store'), $this->loudPayload('A1'))->assertOk();
+        Event::assertDispatchedTimes(CreatedSingleTransactionGroup::class, 1);
+        Event::assertDispatchedTimes(WebhookMessagesRequestSending::class, 1);
+        $this->postJson(route('api.v1.transactions.store'), $this->loudPayload('A1'))->assertStatus(409);
+        Event::assertDispatchedTimes(CreatedSingleTransactionGroup::class, 1);
+        Event::assertDispatchedTimes(WebhookMessagesRequestSending::class, 1);
+    }
+
+    public function testAnUpdateThatConflictsFiresNoEvent(): void
+    {
+        $this->postJson(route('api.v1.transactions.store'), $this->payload('A1'))->assertOk();
+        $b = $this->postJson(route('api.v1.transactions.store'), $this->payload('B1'))->json('data.id');
+        Event::fake([CreatedSingleTransactionGroup::class, UpdatedSingleTransactionGroup::class, WebhookMessagesRequestSending::class]);
+        $this->putJson(route('api.v1.transactions.update', ['transactionGroup' => $b]), ['apply_rules' => true, 'fire_webhooks' => true, 'transactions' => [['plaid_links' => [['plaid_transaction_id' => 'A1', 'leg' => 'single']]]]])->assertStatus(409);
+        Event::assertNotDispatched(UpdatedSingleTransactionGroup::class);
+        Event::assertNotDispatched(WebhookMessagesRequestSending::class);
+        $this->assertSame(1, PlaidTransactionLink::where('plaid_transaction_id', 'B1')->count());
+    }
+
+    public function testASuccessfulCreateFiresTheEventsAfterTheCommit(): void
+    {
+        $base = DB::transactionLevel();
+        $seen = [];
+        Event::listen(CreatedSingleTransactionGroup::class, static function () use (&$seen): void { $seen[] = DB::transactionLevel(); });
+        $this->postJson(route('api.v1.transactions.store'), $this->loudPayload('A1'))->assertOk();
+        $this->assertSame([$base], $seen);
     }
 
     public function testAccountDeleteFreesLinksAndReimportWorks(): void

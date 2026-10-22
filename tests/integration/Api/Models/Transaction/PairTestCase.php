@@ -110,7 +110,7 @@ abstract class PairTestCase extends TestCase
         $ahead    = ($o['journalAhead'] ?? false) ? now()->addSecond()->toDateTimeString() : $now;
         $journal  = DB::table('transaction_journals')->insertGetId([
             'user_id' => $uid, 'user_group_id' => $ugid, 'transaction_group_id' => $group, 'transaction_type_id' => 'withdrawal' === $type ? 7 : 1,
-            'transaction_currency_id' => $currency, 'description' => $desc, 'date' => '2026-10-01 00:00:00', 'date_tz' => 'UTC', 'order' => 0, 'tag_count' => 0,
+            'transaction_currency_id' => $currency, 'description' => $desc, 'date' => ($o['date'] ?? '2026-10-01').' 00:00:00', 'date_tz' => 'UTC', 'order' => 0, 'tag_count' => 0,
             'encrypted' => false, 'completed' => true, 'created_at' => $now, 'updated_at' => $ahead,
         ]);
         $own      = $o['account']->id;
@@ -291,6 +291,9 @@ abstract class PairTestCase extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        if ('pgsql' !== DB::connection()->getDriverName()) {
+            $this->markTestSkipped('pair merges need PostgreSQL (see PairDriverGuardTest)');
+        }
         $this->user   = $this->createAuthenticatedUser();
         $this->actingAs($this->user, 'api');
         $this->assetA = Account::factory()->for($this->user)->withType(AccountTypeEnum::ASSET)->create(['name' => 'Asset A', 'user_group_id' => $this->user->user_group_id]);

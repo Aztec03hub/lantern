@@ -35,6 +35,7 @@ use FireflyIII\Transformers\TransactionGroupTransformer;
 use FireflyIII\User;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
 use League\Fractal\Resource\Item;
@@ -67,6 +68,9 @@ final class PairController extends Controller
      */
     public function destroy(Request $request, string $pairMerge): JsonResponse
     {
+        if (null !== ($unsupported = $this->refuseOffPostgres())) {
+            return $unsupported;
+        }
         $userGroup = $this->validateUserGroup($request);
 
         try {
@@ -93,6 +97,9 @@ final class PairController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        if (null !== ($unsupported = $this->refuseOffPostgres())) {
+            return $unsupported;
+        }
         $userGroup = $this->validateUserGroup($request);
         try {
             $data = $request->validate([
@@ -184,6 +191,17 @@ final class PairController extends Controller
         }
 
         return response()->json(['message' => 'Pair busy: try again', 'reason' => 'busy', 'retry' => true], 503)->header('Retry-After', '1')->header('Content-Type', self::JSON_CONTENT_TYPE);
+    }
+
+    /** Pair merges depend on Postgres (advisory locks, FOR UPDATE SKIP LOCKED, partial unique index): refuse everywhere else. */
+    private function refuseOffPostgres(): ?JsonResponse
+    {
+        $driver = DB::connection()->getDriverName();
+        if ('pgsql' === $driver) {
+            return null;
+        }
+
+        return response()->json(['message' => 'Pair merges need PostgreSQL; this database is '.$driver.'.', 'reason' => 'unsupported_database', 'driver' => $driver], 501)->header('Content-Type', self::JSON_CONTENT_TYPE);
     }
 
     private function refused(PairRefusedException $e): JsonResponse

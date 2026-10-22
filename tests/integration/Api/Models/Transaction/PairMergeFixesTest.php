@@ -413,6 +413,81 @@ final class PairMergeFixesTest extends PairTestCase
         $this->assertFalse($dirty($early));
     }
 
+    /** E26: the post-commit listener never ran, so the later rows stay flagged (and wrong) until the repair command rewrites them. */
+    public function testWhenThePostCommitListenerNeverRunsTheLaterRowsStayFlaggedAndTheRepairCommandFixesThem(): void
+    {
+        [$keep, $abs, $mid, $late, $early] = $this->balanceFixture();
+        $this->listenerDown();
+        $this->expectListenerFailure(fn () => $this->merge($keep, $abs));
+        $this->assertSame(1, $this->liveMerges());
+        $this->assertStaleThenRepaired($mid, $late, $early);
+    }
+
+    public function testWhenThePostCommitListenerNeverRunsOnUnmergeTheRepairCommandFixesIt(): void
+    {
+        [$keep, $abs, $mid, $late, $early] = $this->balanceFixture();
+        $id = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
+        DB::table('transactions')->update(['balance_dirty' => false]);
+        $this->assertRunningBalance($this->assetB, 'merged');
+        $this->listenerDown();
+        $this->expectListenerFailure(fn () => $this->unmerge($id));
+        $this->assertSame(0, $this->liveMerges());
+        $this->assertStaleThenRepaired($mid, $late, $early);
+    }
+
+    /** @return array{0: array, 1: array, 2: array, 3: array, 4: array} keep, abs, mid, late, early; balances right and nothing flagged */
+    private function balanceFixture(): array
+    {
+        $keep  = $this->single(['type' => 'withdrawal', 'account' => $this->assetA, 'plaid' => 'OUT1', 'date' => '2026-10-03']);
+        $abs   = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'IN1', 'date' => '2026-10-01']);
+        $mid   = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'MID', 'date' => '2026-10-02', 'amount' => '10.00']);
+        $late  = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'LATE', 'date' => '2026-10-05', 'amount' => '5.00']);
+        $early = $this->single(['type' => 'deposit', 'account' => $this->assetB, 'plaid' => 'EARLY', 'date' => '2026-09-20']);
+        $this->assertRunningBalance($this->assetB, 'before');
+        DB::table('transactions')->update(['balance_dirty' => false]);
+
+        return [$keep, $abs, $mid, $late, $early];
+    }
+
+    private function listenerDown(): void
+    {
+        $this->withoutExceptionHandling();
+        // the real recalculation listener must not run first: drop every listener, then register the failing one
+        $this->app->make('events')->forget(UpdatedSingleTransactionGroup::class);
+        Event::listen(UpdatedSingleTransactionGroup::class, static function (): void {
+            throw new \RuntimeException('listener down');
+        });
+    }
+
+    private function expectListenerFailure(callable $call): void
+    {
+        try {
+            $call();
+            $this->fail('the post-commit listener failure must surface');
+        } catch (\Throwable $e) {
+            $this->assertStringContainsString('listener down', $e->getMessage().($e->getPrevious()?->getMessage() ?? ''));
+        }
+    }
+
+    private function assertStaleThenRepaired(array $mid, array $late, array $early): void
+    {
+        $dirty = static fn (array $ref): bool => (bool) DB::table('transactions')->where('transaction_journal_id', $ref['journal'])->where('amount', '>', 0)->value('balance_dirty');
+        $this->assertTrue($dirty($mid), 'mid flagged');
+        $this->assertTrue($dirty($late), 'late flagged');
+        $this->assertFalse($dirty($early), 'early not flagged');
+        $wrong = false;
+        try {
+            $this->assertRunningBalance($this->assetB, 'stale');
+        } catch (\PHPUnit\Framework\AssertionFailedError) {
+            $wrong = true;
+        }
+        $this->assertTrue($wrong, 'the flagged rows really are wrong (otherwise the test proves nothing)');
+        $this->artisan('firefly-iii:refresh-running-balance')->assertExitCode(0);
+        $this->assertRunningBalance($this->assetA, 'after repair');
+        $this->assertRunningBalance($this->assetB, 'after repair');
+        $this->assertSame(0, DB::table('transactions')->whereIn('account_id', [$this->assetA->id, $this->assetB->id])->whereNull('deleted_at')->where('balance_dirty', true)->count());
+    }
+
     /** core-3 L6: unmerge fires UPDATED once and DESTROYED not at all (merge fired DESTROYED once). */
     public function testUnmergeFiresTheUpdatedEvent(): void
     {
