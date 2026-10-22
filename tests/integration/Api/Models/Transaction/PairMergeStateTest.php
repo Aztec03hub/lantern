@@ -415,6 +415,9 @@ final class PairMergeStateTest extends PairTestCase
 
     public function testAHardDeleteOfTheKeptJournalLeavesTheSnapshotInTheArchive(): void
     {
+        if ('pgsql' !== DB::connection()->getDriverName()) {
+            $this->markTestSkipped('the keep foreign key cascade is only enforced on Postgres here (SQLite runs without foreign keys)');
+        }
         [$keep, $abs] = $this->pair($this->assetA, $this->assetB, 'OUT1', 'IN1', ['tags' => ['k1']], ['tags' => ['k2'], 'notes' => 'abs note']);
         $id           = $this->merge($keep, $abs)->assertOk()->json('data.pair_merge_id');
         $snapshot     = DB::table('pair_merges')->where('id', $id)->value('absorbed_snapshot');
