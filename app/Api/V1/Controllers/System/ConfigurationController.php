@@ -30,6 +30,8 @@ use FireflyIII\Enums\WebhookDelivery;
 use FireflyIII\Enums\WebhookResponse;
 use FireflyIII\Enums\WebhookTrigger;
 use FireflyIII\Exceptions\FireflyException;
+use FireflyIII\Models\Transaction;
+use FireflyIII\Support\Models\AccountBalanceCalculator;
 use FireflyIII\Support\Binder\EitherConfigKey;
 use FireflyIII\Support\Facades\AppConfiguration;
 use Illuminate\Http\JsonResponse;
@@ -60,7 +62,7 @@ final class ConfigurationController extends Controller
             $return[] = [
                 'title'    => sprintf('configuration.%s', $key),
                 'value'    => $value,
-                'editable' => true,
+                'editable' => 'running_balance_dirty' !== $key,
             ];
         }
         foreach ($staticData as $key => $value) {
@@ -86,7 +88,7 @@ final class ConfigurationController extends Controller
             $data = [
                 'title'    => $configKey,
                 'value'    => $dynamic[$shortKey],
-                'editable' => true,
+                'editable' => 'running_balance_dirty' !== $shortKey,
             ];
 
             return response()->api(['data' => $data])->header('Content-Type', self::JSON_CONTENT_TYPE);
@@ -125,6 +127,20 @@ final class ConfigurationController extends Controller
         $data      = $request->getAll();
         $shortName = str_replace('configuration.', '', $name);
 
+        // Turning the running balance on refreshes every stored balance first, so rows written while it was off are
+        // right. Refresh BEFORE the set and without a catch: a failure leaves the setting and the dirty flag as they were.
+        // A PUT true while already on also repairs leftover dirty rows (a retry after a crashed bulk run).
+        $refresh = false;
+        if ('use_running_balance' === $shortName && true === $data['value']) {
+            $was     = AppConfiguration::getFresh('use_running_balance')?->data;
+            $refresh = (null !== $was && true !== $was) || Transaction::query()->where('balance_dirty', true)->exists();
+        }
+        $rows = 0;
+        if ($refresh) {
+            $rows = Transaction::query()->count();
+            // ponytail: full recalculation in one request, move to a queued job if the table grows past a few hundred thousand rows
+            AccountBalanceCalculator::recalculateAll(true);
+        }
         AppConfiguration::set($shortName, $data['value']);
 
         // get updated config:
@@ -134,6 +150,10 @@ final class ConfigurationController extends Controller
             'value'    => $newConfig[$shortName],
             'editable' => true,
         ];
+        if ($refresh) {
+            $data['refreshed'] = true;
+            $data['rows']      = $rows;
+        }
 
         return response()->api(['data' => $data])->header('Content-Type', self::CONTENT_TYPE);
     }
@@ -169,6 +189,8 @@ final class ConfigurationController extends Controller
             'allow_webhooks'          => $allowWebhooks?->data,
             'enable_batch_processing' => $enableBatchProcessing?->data,
             'valid_url_protocols'     => $validUrlProtocols->data ?? config('firefly.valid_url_protocols'),
+            // derived read-only flag: some live row holds a balance written while the running balance was off
+            'running_balance_dirty'   => Transaction::query()->where('balance_dirty', true)->exists(),
         ];
     }
 

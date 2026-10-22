@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 if [ $# -eq 0 ]; then
   LOG=$(mktemp -d)
   trap 'rm -rf "$LOG"' EXIT
-  GROUPS_=(PairMerge PairState PairFixes PairConcurrency PlaidLink)
-  declare -A FILTER=([PairMerge]='PairMergeTest' [PairState]='PairMergeStateTest' [PairFixes]='PairMergeFixesTest' [PairConcurrency]='PairConcurrency' [PlaidLink]='PlaidLink|PlaidAccountDelete')
+  GROUPS_=(PairMerge PairState PairFixes PairConcurrency PlaidLink RunningBalance)
+  declare -A FILTER=([PairMerge]='PairMergeTest' [PairState]='PairMergeStateTest' [PairFixes]='PairMergeFixesTest' [PairConcurrency]='PairConcurrency' [PlaidLink]='PlaidLink|PlaidAccountDelete' [RunningBalance]='RunningBalanceRefresh')
   # the keys are written once here, so three parallel stacks do not race on the shared storage/ directory
   mkdir -p storage
   [ -f storage/oauth-private.key ] || docker run --rm --user "$(id -u):$(id -g)" -e APP_KEY=SomeRandomStringOf32CharsExactly -v "$PWD":/var/www/html -w /var/www/html --entrypoint php "${FIREFLY_IMAGE:-fireflyiii/core:version-6.7.7}" artisan passport:keys -q >/dev/null

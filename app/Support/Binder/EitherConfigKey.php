@@ -64,6 +64,9 @@ class EitherConfigKey
         'webhook.deliveries',
     ];
 
+    /** Readable through GET, never writable (not in DynamicConfigKey::$accepted). */
+    public static array $readOnly = ['configuration.running_balance_dirty'];
+
     /**
      * @throws NotFoundHttpException
      *
@@ -71,7 +74,7 @@ class EitherConfigKey
      */
     public static function routeBinder(string $value, Route $route): string
     {
-        if (in_array($value, self::$static, true) || in_array($value, DynamicConfigKey::$accepted, true)) {
+        if (in_array($value, self::$static, true) || in_array($value, DynamicConfigKey::$accepted, true) || in_array($value, self::$readOnly, true)) {
             return $value;
         }
 
